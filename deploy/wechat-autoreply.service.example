@@ -1,0 +1,23 @@
+[Unit]
+Description=Xiaoi personal WeChat agent
+After=network-online.target graphical.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wechat
+Group=wechat
+WorkingDirectory=/opt/wechat-autoreply
+Environment=DISPLAY=:1
+Environment=XAUTHORITY=/home/wechat/.Xauthority
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/wechat-autoreply/.venv/bin/python -B /opt/wechat-autoreply/bridge.py --config /opt/wechat-autoreply/config.json
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

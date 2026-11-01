@@ -1,0 +1,5 @@
+# Versions observed on the source deployment when this snapshot was prepared.
+Pillow==13.0.0
+numpy==2.4.6
+zstandard==0.25.0
+pycryptodome==4.2.0

@@ -1,0 +1,6 @@
+# Voice synthesis and decoding; native voice also needs a configured audio session.
+miniaudio==1.71
+edge-tts==7.3.1
+breeze-blue==0.22.1
+# Linux SQLCipher bindings; wheel availability depends on platform and Python.
+sqlcipher3-binary==0.6.0

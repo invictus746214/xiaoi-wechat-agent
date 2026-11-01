@@ -1,0 +1,156 @@
+{
+  "api": {
+    "url": "https://api.deepseek.com/chat/completions",
+    "model": "YOUR_CHAT_MODEL",
+    "key_file": "/etc/wechat-autoreply.env",
+    "timeout": 45,
+    "max_tokens": 256
+  },
+  "persona_file": "persona.md",
+  "memory": {
+    "enabled": true,
+    "recent_turns": 40,
+    "max_facts": 20,
+    "retention_days": 14,
+    "summary_every": 60,
+    "replay_minutes": 15,
+    "db": "/var/lib/wechat-autoreply/state.db",
+    "scene_state_enabled": true,
+    "semantic_enabled": true
+  },
+  "metrics": {
+    "enabled": true,
+    "path": "/var/lib/wechat-autoreply/metrics.jsonl",
+    "days": 7
+  },
+  "ocr": {
+    "enabled": true,
+    "image_enabled": true,
+    "lang": "chi_sim+eng",
+    "timeout": 8
+  },
+  "runtime": {
+    "database_pipeline": true,
+    "config_reload_seconds": 10,
+    "purge_check_minutes": 30,
+    "reply_unread_on_start": false,
+    "catch_up_on_start": false
+  },
+  "tools": {
+    "enabled": true,
+    "max_rounds": 2
+  },
+  "policy": {
+    "quiet_hours": [],
+    "group_mention_only": true,
+    "group_mention_reply": true,
+    "group_self_name": "小i",
+    "group_self_names": [
+      "小i"
+    ],
+    "group_always_reply": [],
+    "group_engaged_seconds": 300,
+    "group_interject_enabled": false,
+    "group_interject_probability": 0.08,
+    "group_interject_min_seconds": 600,
+    "group_check_min_seconds": 30,
+    "whitelist": [],
+    "skip_contacts": [
+      "Weixin Team",
+      "Tencent News",
+      "File Transfer",
+      "文件传输助手"
+    ],
+    "daily_reply_cap": 0
+  },
+  "proactive": {
+    "enabled": false,
+    "group_interjections": false,
+    "greetings": [],
+    "heartbeat_minutes": 30,
+    "webhook": ""
+  },
+  "vision": {
+    "enabled": false,
+    "url": "https://api.deepseek.com/chat/completions",
+    "model": "YOUR_VISION_MODEL",
+    "key_file": "",
+    "timeout": 30,
+    "max_tokens": 600,
+    "prompt": "用一句中文描述这张微信图片里的内容，看不清就说看不清。"
+  },
+  "moments": {
+    "enabled": false,
+    "post_at": [],
+    "scan_minutes": 30,
+    "scan_pages": 1,
+    "interaction_enabled": false,
+    "interaction_minutes": 10,
+    "max_posts": 10,
+    "dry_run": true,
+    "authors": [],
+    "skip_authors": [],
+    "skip_keywords": [],
+    "aliases": [],
+    "quiet_hours": [],
+    "like_enabled": false,
+    "comment_enabled": false,
+    "like_daily_cap": 20,
+    "comment_daily_cap": 20,
+    "comment_author_interval_seconds": 21600,
+    "comment_repeat_days": 7,
+    "min_interval_seconds": 20
+  },
+  "dispatch": {
+    "workers": 2,
+    "max_outbox": 64
+  },
+  "quality": {
+    "critic_enabled": false,
+    "structured_reply": true,
+    "intelligence_enabled": true
+  },
+  "tasks": {
+    "enabled": false
+  },
+  "learning": {
+    "enabled": false
+  },
+  "storage": {
+    "db_reader_enabled": true,
+    "wcdb_keys": "/etc/wechat-autoreply/wcdb-keys.json",
+    "db_cache": "/var/lib/wechat-autoreply/db-cache"
+  },
+  "voice": {
+    "enabled": false,
+    "style": "playful",
+    "max_chars": 140,
+    "allow_private_only": false
+  },
+  "relay": {
+    "enabled": false,
+    "allowed_titles": []
+  },
+  "stickers": {
+    "enabled": false,
+    "auto_send": false,
+    "library_dir": "/var/lib/wechat-autoreply/stickers",
+    "send_probability": 0.3,
+    "min_interval_seconds": 600,
+    "same_sticker_interval_seconds": 86400,
+    "passive_collect": false,
+    "prepare_before_reply": false,
+    "capabilities_enabled": false
+  },
+  "delivery": {
+    "split_enabled": true,
+    "split_threshold": 25,
+    "split_target": 30,
+    "split_max": 3,
+    "quota_enabled": true,
+    "max_per_minute": 6,
+    "max_per_10min": 30,
+    "private_min_interval_seconds": 1,
+    "group_min_interval_seconds": 15
+  }
+}
