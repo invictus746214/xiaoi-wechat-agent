@@ -1,5 +1,5 @@
 import unittest
-from PIL import Image
+from PIL import Image,ImageDraw
 
 from sticker_ui import match_tile, sticker_receipt,NativeStickers
 from sticker_ui import focus_owned,popup_windows,WindowAttributes
@@ -11,6 +11,16 @@ import bridge
 
 
 class StickerUITests(unittest.TestCase):
+    def test_rectangular_bubble_preserves_artwork_aspect_ratio(self):
+        for size in ((160,60),(60,160)):
+            image=Image.new('RGB',size,'white')
+            draw=ImageDraw.Draw(image)
+            draw.rectangle((5,5,size[0]//2,size[1]-5),fill='navy')
+            draw.ellipse((size[0]//2,5,size[0]-5,size[1]-5),fill='red')
+            other=Image.new('RGB',size,'green')
+            self.assertEqual(match_tile([image],[other,image]),1)
+            self.assertIsNone(match_tile([image],[image,image]))
+
     def test_exact_image_matches_and_ambiguous_tiles_are_rejected(self):
         image=Image.new('RGB',(72,72),'blue')
         image.putpixel((30,30),(255,255,255))

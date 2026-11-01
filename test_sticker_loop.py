@@ -54,11 +54,80 @@ class StickerLoopTests(unittest.TestCase):
         clipped=SimpleNamespace(x=0,y=-23,width=500,height=152);full=SimpleNamespace(x=0,y=10,width=500,height=152)
         ui=Mock();ui.rows.side_effect=[[('Animated Stickers',clipped,None)],[('Animated Stickers',full,None)]];ui.incoming_state.return_value='incoming'
         reader=Mock();reader.messages.return_value=[self.message]
-        b=Mock();b.component_rect.return_value=box;b.is_image_stub.return_value=True;b.image_capture_rect.return_value=(60,10,150,120)
+        b=Mock();b.component_rect.return_value=box;b.is_image_stub.return_value=True;b.image_capture_rect.return_value=(60,10,150,120);b.moments.walk.return_value=[]
         native=NativeStickers(ui,reader,b);native.favorite_records=Mock(return_value=[]);native.capture=Mock(return_value=None)
         result=native.favorite_latest(dict(md5=self.digest),self.job,lambda *args:True,lambda:True)
         self.assertEqual(result,'source_image_unverified')
         self.assertTrue(any(call.kwargs.get('up') for call in ui.pointer().scroll.call_args_list))
+
+    def test_urgent_message_prevents_favorite_chat_selection(self):
+        from sticker_ui import NativeStickers
+        ui=Mock();reader=Mock();reader.messages.return_value=[self.message]
+        native=NativeStickers(ui,reader,Mock(),should_yield=lambda:True)
+        native.favorite_records=Mock(return_value=[]);select=Mock(return_value=False)
+        result=native.favorite_latest(dict(md5=self.digest),self.job,select,lambda:True)
+        self.assertEqual(result,'yield')
+        select.assert_not_called()
+
+    def test_urgent_message_after_decode_prevents_opening_context_menu(self):
+        from sticker_ui import NativeStickers
+        box=SimpleNamespace(x=0,y=0,width=500,height=418)
+        row=SimpleNamespace(x=0,y=10,width=500,height=152)
+        ui=Mock();ui.rows.return_value=[('Animated Stickers',row,None)];ui.incoming_state.return_value='incoming'
+        reader=Mock();reader.messages.return_value=[self.message]
+        b=Mock();b.component_rect.return_value=box;b.is_image_stub.return_value=True;b.image_capture_rect.return_value=(60,10,150,120)
+        b.moments.walk.return_value=[]
+        urgent=[False]
+        native=NativeStickers(ui,reader,b,should_yield=lambda:urgent[0]);native.favorite_records=Mock(return_value=[])
+        native.capture=Mock(return_value=Image.new('RGB',(150,120),'blue'))
+        def decode(_):urgent[0]=True;return []
+        native.templates=Mock(side_effect=decode)
+        with patch('sticker_ui.match_tile',return_value=0),patch('sticker_ui.time.sleep'):
+            self.assertEqual(native.favorite_latest(dict(md5=self.digest),self.job,lambda *args:True,lambda:True),'yield')
+        ui.pointer().xtst.XTestFakeButtonEvent.assert_not_called()
+
+    def test_submitted_favorite_yields_as_unconfirmed_without_another_click(self):
+        from sticker_ui import NativeStickers
+        box=SimpleNamespace(x=0,y=0,width=500,height=418)
+        row=SimpleNamespace(x=0,y=10,width=500,height=152)
+        ui=Mock();ui.rows.return_value=[('Animated Stickers',row,None)];ui.incoming_state.return_value='incoming'
+        reader=Mock();reader.messages.return_value=[self.message]
+        b=Mock();b.component_rect.return_value=box;b.is_image_stub.return_value=True;b.image_capture_rect.return_value=(60,10,150,120)
+        control=Mock();control.name='Add Sticker';control.getRoleName.return_value='menu item'
+        b.moments.walk.return_value=[control]
+        urgent=[False]
+        native=NativeStickers(ui,reader,b,should_yield=lambda:urgent[0]);native.favorite_records=Mock(return_value=[])
+        native.capture=Mock(return_value=Image.new('RGB',(150,120),'blue'));native.templates=Mock(return_value=[])
+        def clicked(*_):urgent[0]=True;return True
+        b._click_rect.side_effect=clicked
+        with patch('sticker_ui.match_tile',return_value=0),patch('sticker_ui.time.sleep'):
+            self.assertEqual(native.favorite_latest(dict(md5=self.digest),self.job,lambda *args:True,lambda:True),'unconfirmed')
+        b._click_rect.assert_called_once();native.favorite_records.assert_called_once()
+
+    def test_new_media_during_decode_prevents_using_old_bubble_coordinates(self):
+        from sticker_ui import NativeStickers
+        box=SimpleNamespace(x=0,y=0,width=500,height=418);row=SimpleNamespace(x=0,y=10,width=500,height=152)
+        ui=Mock();ui.rows.return_value=[('Animated Stickers',row,None)];ui.incoming_state.return_value='incoming'
+        reader=Mock();reader.messages.side_effect=[[self.message],[self.message,dict(self.message,local_id=2,sticker_hashes=['c'*32])]]
+        b=Mock();b.component_rect.return_value=box;b.is_image_stub.return_value=True;b.image_capture_rect.return_value=(60,10,150,120);b.moments.walk.return_value=[]
+        native=NativeStickers(ui,reader,b);native.favorite_records=Mock(return_value=[])
+        native.capture=Mock(return_value=Image.new('RGB',(150,120),'blue'));native.templates=Mock(return_value=[])
+        with patch('sticker_ui.match_tile',return_value=0),patch('sticker_ui.time.sleep'):
+            self.assertEqual(native.favorite_latest(dict(md5=self.digest),self.job,lambda *args:True,lambda:True),'source_not_latest')
+        ui.pointer().xtst.XTestFakeButtonEvent.assert_not_called()
+
+    def test_bubble_moved_during_decode_is_rechecked_before_click(self):
+        from sticker_ui import NativeStickers
+        box=SimpleNamespace(x=0,y=0,width=500,height=418);row=SimpleNamespace(x=0,y=10,width=500,height=152)
+        ui=Mock();ui.rows.return_value=[('Animated Stickers',row,None)];ui.incoming_state.return_value='incoming'
+        reader=Mock();reader.messages.return_value=[self.message]
+        b=Mock();b.component_rect.return_value=box;b.is_image_stub.return_value=True;b.image_capture_rect.return_value=(60,10,150,120);b.moments.walk.return_value=[]
+        original=Image.new('RGB',(150,120),'blue');moved=Image.new('RGB',(150,120),'red')
+        native=NativeStickers(ui,reader,b);native.favorite_records=Mock(return_value=[])
+        native.capture=Mock(side_effect=[original,moved]);native.templates=Mock(return_value=[original])
+        with patch('sticker_ui.time.sleep'):
+            self.assertEqual(native.favorite_latest(dict(md5=self.digest),self.job,lambda *args:True,lambda:True),'source_image_unverified')
+        ui.pointer().xtst.XTestFakeButtonEvent.assert_not_called()
 
     def test_collection_restart_only_retries_readonly_collection_with_limit(self):
         queue=CollectQueue(self.store,'self');queue.enqueue('friend',self.row,now=self.stamp)

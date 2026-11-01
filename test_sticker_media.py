@@ -21,6 +21,31 @@ def picture():
 
 
 class StickerMediaTests(unittest.TestCase):
+    def test_container_prefix_failure_retries_without_losing_parameter_sets(self):
+        # A container prefix can resemble an invalid NAL before the real SPS/VPS.
+        for first_header in (b'\x40\x01',b'\x42\x01'):
+            stream=b'\x00\x00\x01'+first_header+b'parameters\x00\x00\x01\x40\x01vps'
+            raw=b'wxgf\x00\x00\x00\x01\x0a\x01container'+stream
+            with self.subTest(first_header=first_header),tempfile.TemporaryDirectory() as root:
+                attempts=[]
+                def decode(args,**kwargs):
+                    attempts.append(Path(args[args.index('-i')+1]).read_bytes())
+                    if len(attempts)==1:return SimpleNamespace(returncode=1)
+                    Path(args[-1].replace('%03d','001')).write_bytes(picture())
+                    return SimpleNamespace(returncode=0)
+                with patch('sticker_media.ffmpeg_executable',return_value='/tool'),patch('sticker_media.subprocess.run',side_effect=decode) as run,patch('sticker_media.time.monotonic',side_effect=[100,109]):
+                    paths=sticker_media.frames(raw,root)
+                self.assertEqual(attempts,[raw,stream])
+                self.assertEqual(len(paths),1)
+                self.assertEqual(run.call_args.kwargs['timeout'],3)
+                self.assertLess(run.call_args.args[0].index('-max_pixels'),run.call_args.args[0].index('-i'))
+
+    def test_decoder_does_not_retry_after_shared_time_budget_is_exhausted(self):
+        raw=b'wxgf-container\x00\x00\x01\x40\x01parameters'
+        with tempfile.TemporaryDirectory() as root,patch('sticker_media.ffmpeg_executable',return_value='/tool'),patch('sticker_media.subprocess.run',return_value=SimpleNamespace(returncode=1)) as run,patch('sticker_media.time.monotonic',side_effect=[100,113]):
+            self.assertEqual(sticker_media.frames(raw,root),[])
+        self.assertEqual(run.call_count,1)
+
     def test_dynamic_decoder_bounds_pixels_before_opening_input(self):
         with tempfile.TemporaryDirectory() as root, patch('sticker_media.ffmpeg_executable',return_value='/tool'), patch('sticker_media.subprocess.run',return_value=SimpleNamespace(returncode=1)) as run:
             self.assertEqual(sticker_media.frames(b'wxgf-test',root),[])

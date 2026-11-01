@@ -77,6 +77,7 @@ def match_tile(templates,tiles,threshold=.08,margin=.025):
         target=tile.convert('RGB').resize((32,32))
         corners=[target.getpixel(p) for p in ((0,0),(31,0),(0,31),(31,31))]
         background=tuple(sorted(c[i] for c in corners)[2] for i in range(3))
+        target=ImageOps.pad(tile.convert('RGB'),(32,32),color=background)
         best=1.0
         for template in templates:
             for size in (32,29,26,23):
@@ -253,6 +254,7 @@ class NativeStickers:
             if not submitted:self.close()
 
     def favorite_latest(self,asset,job,select_chat,before_submit):
+        if self.should_yield():return 'yield'
         digest=asset['md5']
         row=favorite_source(asset,job)
         hashes=row['message'].get('sticker_hashes',[]) if row else []
@@ -264,7 +266,10 @@ class NativeStickers:
         if not current or current[-1]['local_id']!=message['local_id']:return 'source_not_latest'
         if not select_chat(self.ui,self.reader,job,self.b):return 'chat_unverified'
         bounds=self.b.component_rect(self.ui.right_list,self.ui.pyatspi)
-        pointer=self.ui.pointer();pointer.move(bounds.x+bounds.width//2,bounds.y+bounds.height//2);pointer.scroll(40)
+        pointer=self.ui.pointer();pointer.move(bounds.x+bounds.width//2,bounds.y+bounds.height//2)
+        for _ in range(8):
+            if self.should_yield():return 'yield'
+            pointer.scroll(5)
         time.sleep(.3)
         media=[]
         for attempt in range(5):
@@ -278,7 +283,14 @@ class NativeStickers:
         x,y,w,h=rect if isinstance(rect,tuple) else (rect.x,rect.y,rect.width,rect.height)
         from types import SimpleNamespace
         image=self.capture(SimpleNamespace(x=x,y=y,width=w,height=h))
-        if image is None or match_tile(self.templates(asset),[image],threshold=.12) is None:return 'source_image_unverified'
+        if image is None:return 'source_image_unverified'
+        if self.should_yield():return 'yield'
+        templates=self.templates(asset)
+        if self.should_yield():return 'yield'
+        image=self.capture(SimpleNamespace(x=x,y=y,width=w,height=h))
+        if image is None or match_tile(templates,[image],threshold=.12) is None:return 'source_image_unverified'
+        current=[m for m in self.reader.messages(job['username'],limit=60,source=row['source']) if not m['outgoing'] and (m.get('type',0)&65535) in (3,47)]
+        if not current or current[-1]['local_id']!=message['local_id']:return 'source_not_latest'
         pointer=self.ui.pointer();pointer.move(x+w//2,y+h//2)
         pointer.xtst.XTestFakeButtonEvent(pointer.display,3,True,0)
         pointer.xtst.XTestFakeButtonEvent(pointer.display,3,False,0)
@@ -299,6 +311,7 @@ class NativeStickers:
             return 'yield'
         self.b._click_rect(self.ui,options[0])
         for _ in range(12):
+            if self.should_yield():return 'unconfirmed'
             for native,aliases in self.favorite_records():
                 if digest in aliases or native in hashes:return native
             time.sleep(.25)

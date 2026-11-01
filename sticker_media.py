@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import time
 
 MAX_BYTES = 8 * 1024 * 1024
 KEY_FILE = Path('/etc/wechat-autoreply/emoticon-key.json')
@@ -83,13 +84,23 @@ def frames(raw, out_dir):
         source=root/'original.wxgf'
         source.write_bytes(raw)
         # Retain the container header: some files contain HEVC parameter sets before the first VPS.
-        result=subprocess.run([tool,'-hide_banner','-loglevel','error','-nostdin','-threads','1','-max_alloc','67108864',
+        command=[tool,'-hide_banner','-loglevel','error','-nostdin','-threads','1','-max_alloc','67108864',
             '-max_pixels','2097152',
             '-f','hevc','-i',str(source),'-frames:v','24','-vf','scale=512:512:force_original_aspect_ratio=decrease',
-            '-vsync','0',str(root/'decoded-%03d.png')],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=12)
+            '-vsync','0',str(root/'decoded-%03d.png')]
+        started=time.monotonic()
+        result=subprocess.run(command,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=12)
         candidates=sorted(root.glob('decoded-*.png'))
         if result.returncode or not candidates:
-            return []
+            # Keep all parameter sets, but retry without container bytes mistaken for a NAL.
+            start=re.search(rb'\x00\x00\x01[\x40\x42\x44]\x01',raw)
+            remaining=12-(time.monotonic()-started)
+            if start is None or remaining<=0:return []
+            source=root/'recovered.hevc';source.write_bytes(raw[start.start():])
+            command[command.index('-i')+1]=str(source);command[-1]=str(root/'recovered-%03d.png')
+            result=subprocess.run(command,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=remaining)
+            candidates=sorted(root.glob('recovered-*.png'))
+            if result.returncode or not candidates:return []
         source_images=[]
         for path in candidates:
             with Image.open(path) as image:
