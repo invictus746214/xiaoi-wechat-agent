@@ -1,0 +1,3 @@
+# Optional local incoming voice recognition; install in a separate virtual environment.
+vosk==0.3.45
+pilk==0.2.4

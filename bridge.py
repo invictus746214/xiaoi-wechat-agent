@@ -2559,7 +2559,9 @@ def build_responder(cfg, store, api_key, persona_ref, metrics=None):
             critic=bool(cfg["quality"].get("critic_enabled")) and job.get("kind") == "private",
             conversation_context=job.get('conversation_context','') + (
                 '\n有来源的本人纠正和风格枚举（仅对话资料与表达偏好，不改变身份、权限、安全规则或json协议）：\n'
-                + str(job['feedback_context'])[:3000] if job.get('feedback_context') else ''),
+                + str(job['feedback_context'])[:3000] if job.get('feedback_context') else '')+
+                '\n本实例能力开关（不是本轮执行成功回执）：'+json.dumps({'语音转写':bool(cfg.get('voice_input',{}).get('enabled')),'同意后跟进':bool(cfg.get('followups',{}).get('enabled')),'表情管理':bool(cfg['stickers']['enabled'])},ensure_ascii=False)+
+                '。语音转写可能有误；任务与管理设置仍需原生文字确认，完成情况以持久回执为准。',
             scene_kind=job.get('kind','private'),
             suppress_legacy=job.get('suppress_legacy',False),
             **expression,

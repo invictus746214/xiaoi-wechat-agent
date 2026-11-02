@@ -68,6 +68,9 @@ class StickerLibrary:
                 CREATE TABLE IF NOT EXISTS sticker_sources(
                     account TEXT,id TEXT,scene TEXT,source TEXT,local_id INTEGER,ts REAL,
                     PRIMARY KEY(account,scene,source,local_id));
+                CREATE TABLE IF NOT EXISTS sticker_source_evidence(
+                    account TEXT,scene TEXT,source TEXT,local_id INTEGER,sender TEXT,id TEXT,
+                    PRIMARY KEY(account,scene,source,local_id));
             ''')
 
     def items(self):
@@ -114,14 +117,24 @@ class StickerLibrary:
     def collect_message(self,reader,scene,row,description,raw=None,tags=None):
         import sticker_media
         message=row['message']
-        if (message.get('type',0)&65535)!=47:return None
+        sender=message.get('sender','')
+        if (getattr(reader,'account',None)!=self.account or message.get('outgoing') is not False
+                or (message.get('type',0)&65535)!=47):
+            return None
         hashes=message.get('sticker_hashes') or sticker_media.metadata(message.get('text',''))
         raw=raw or sticker_media.original_bytes(reader.db_dir.parent,reader.account,hashes)
         identifier=self.collect(raw,hashes,description,tags=tags)
         if identifier:
             self.store._write('INSERT OR IGNORE INTO sticker_sources VALUES(?,?,?,?,?,?)',
                 (self.account,identifier,scene,row['source'],int(message['local_id']),message.get('timestamp',time.time())))
+            if sender and (scene.endswith('@chatroom') or sender==scene):
+                self.store._write('INSERT OR REPLACE INTO sticker_source_evidence VALUES(?,?,?,?,?,?)',
+                    (self.account,scene,row['source'],int(message['local_id']),sender,identifier))
             self.store._write('DELETE FROM sticker_sources WHERE account=? AND ts<?',(self.account,time.time()-30*86400))
+            self.store._write('DELETE FROM sticker_source_evidence WHERE account=? AND NOT EXISTS '
+                '(SELECT 1 FROM sticker_sources s WHERE s.account=sticker_source_evidence.account '
+                'AND s.scene=sticker_source_evidence.scene AND s.source=sticker_source_evidence.source '
+                'AND s.local_id=sticker_source_evidence.local_id)',(self.account,))
         return identifier
 
     def pending_for(self,job):

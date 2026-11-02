@@ -46,6 +46,8 @@ def allowed(policy, meta, now=None):
     whitelist = policy.get("whitelist") or []
     if whitelist and name not in whitelist:
         return False, "not_whitelisted"
+    if (meta or {}).get('kind')=='group' and policy.get('group_strict_mention') and not (meta or {}).get('is_mention'):
+        return False,'group_not_mentioned'
     if (meta or {}).get("kind") == "group" and name in (policy.get("group_always_reply") or []):
         return True, "ok"
     if (meta or {}).get("kind") == "group" and policy.get("group_mention_only"):

@@ -29,8 +29,9 @@ def sticker_capabilities(job,library,cfg):
     assets=library.current_assets(job) if library else []
     items=library.items() if library else []
     enabled=bool(library and cfg['stickers'].get('enabled'))
-    return dict(read_images=bool(cfg['vision'].get('enabled')),save_originals=enabled,
-                favorite_native=enabled,send_native=bool(enabled and cfg['stickers'].get('auto_send')),
+    collecting=bool(enabled and cfg['stickers'].get('collect_enabled',True))
+    return dict(read_images=bool(cfg['vision'].get('enabled')),save_originals=collecting,
+                favorite_native=collecting,send_native=bool(enabled and cfg['stickers'].get('auto_send')),
                 ready_count=sum(item['native_state']=='confirmed' for item in items),saved_count=len(items),
                 current_original_saved=bool(assets),current_native_confirmed=bool(assets) and all(item['native_state']=='confirmed' for item in assets))
 
@@ -161,7 +162,7 @@ def deliver_sticker_only(ui,reader,job,reply,library,store,b,cfg,should_yield=No
     return 'unconfirmed' if result=='unconfirmed' else 'done'
 
 
-def run_due_task(ui,reader,tasks,store,inbox,b,cfg,now=None,health=None):
+def run_due_task(ui,reader,tasks,store,inbox,b,cfg,now=None,health=None,followups=None):
     if inbox.count(reader.account,min_priority=3):return False
     for task in tasks.due(reader.account,now=now):
         job=dict(username=task['username'],title=task['title'],account=reader.account,person_id=task['person_id'],
@@ -173,7 +174,8 @@ def run_due_task(ui,reader,tasks,store,inbox,b,cfg,now=None,health=None):
         if health:health.note(job,'sending','command')
         try:
             single=copy.deepcopy(cfg);single['delivery']['split_enabled']=False
-            result=send_reply(ui,reader,job,'提醒：'+task['body'],store,b,single)
+            body=followups.delivery_text(task) if followups else None
+            result=send_reply(ui,reader,job,body or '提醒：'+task['body'],store,b,single)
             tasks.finish(task['id'],'confirmed' if result=='done' else 'pending' if result=='retry' else 'unconfirmed')
             if health:health.note(job,'confirmed' if result=='done' else 'retry' if result=='retry' else 'uncertain','sent' if result=='done' else 'send_retry' if result=='retry' else 'send_unknown')
         except Exception:
@@ -328,7 +330,7 @@ def build_job(batch, inbox, b, cfg, account):
     head, latest = batch[0], batch[-1]
     user = head["username"]
     group = user.endswith("@chatroom")
-    explicit=[row for row in batch if b.mentioned_self(row['message'].get('text',''),b.policy_self_names(cfg)) or row['message'].get('quote_sender')==account]
+    explicit=[row for row in batch if ((row['message'].get('type',1)&65535)==1 and b.mentioned_self(row['message'].get('text',''),b.policy_self_names(cfg))) or row['message'].get('quote_sender')==account]
     focus=explicit[-1] if group and explicit else latest
     parts = []
     for row in batch:
@@ -358,6 +360,10 @@ def build_job(batch, inbox, b, cfg, account):
                 force_reply=False, batch=batch, started=time.monotonic(), focus=focus,
                 person_id=str(focus['message'].get('sender','')) if group else user,
                 focus_text=raw_latest,quote_sender=focus['message'].get('quote_sender',''))
+
+
+def group_reply_relevant(job,active,eligible,interject,cfg):
+    return bool(job.get('is_mention') or active or interject or (eligible and job.get('title') in cfg['policy'].get('group_always_reply',[])))
 
 
 def choose_command(job, b, cfg, owner):
@@ -626,6 +632,70 @@ def task_command_reply(tasks,job):
     return None if is_composite_request(job) else tasks.handle(job)
 
 
+def verified_management_owner(job,owners,cfg):
+    identifiers=cfg['runtime'].get('owner_ids',[])
+    return job.get('kind')=='private' and (job['username'] in identifiers if identifiers else owners.get(job['username']) in {t.casefold() for t in cfg['relay']['allowed_titles']})
+
+
+def capability_reply(job,reader,store,cfg,controls=None,owner=False,stickers=None,followups=None):
+    from runtime_controls import is_command
+    focus=job.get('focus',{}).get('message',{})
+    if (job.get('account')!=getattr(reader,'account',None) or focus.get('outgoing') is not False
+            or focus.get('type')!=1 or focus.get('sender')!=job.get('person_id')
+            or focus.get('quote_sender') or focus.get('quote_text')):return None
+    if job.get('kind')=='group' and not job.get('is_mention') and job.get('group_reply_mode')!='engaged':return None
+    command_text=own_text(focus).strip()
+    if job.get('kind')=='group':
+        for name in job.get('self_names',[]):command_text=re.sub(r'^@'+re.escape(name)+r'[\s\u2005]+','',command_text,count=1)
+    if controls and is_command(command_text):
+        if not owner:return '管理设置只接受已验证的主人账号私聊指令。'
+        return controls.handle(job,owner) or '无法验证这条管理指令的原始来源，设置未更改。'
+    if stickers:
+        import sticker_commands
+        if sticker_commands.recognizes(job):backfill_sticker_evidence(job,reader,stickers,store)
+        reply=sticker_commands.handle(job,stickers,store)
+        if reply is not None:return reply
+    if followups:
+        reply=followups.handle(job)
+        if reply is not None:return reply
+        offer=followups.observe(job)
+        if offer:
+            job['conversation_context']=job.get('conversation_context','')+'\n本会话可选择的跟进提议（尚未获得同意，不是已安排的任务）：'+offer
+    return None
+
+
+def backfill_sticker_evidence(job,reader,library,store):
+    cutoff=min(time.time(),job['focus']['message']['timestamp'])
+    rows=store._rows('SELECT s.*,a.md5 FROM sticker_sources s JOIN sticker_assets a ON a.account=s.account AND a.id=s.id WHERE s.account=? AND s.scene=? AND s.ts>=? AND s.ts<=? AND NOT EXISTS (SELECT 1 FROM sticker_source_evidence e WHERE e.account=s.account AND e.scene=s.scene AND e.source=s.source AND e.local_id=s.local_id) ORDER BY s.ts DESC LIMIT 40',(library.account,job['username'],cutoff-600,cutoff))
+    sources={}
+    for row in rows:
+        if row['source'] not in sources:sources[row['source']]=reader.messages(job['username'],limit=200,source=row['source'])
+        message=next((m for m in sources[row['source']] if m['local_id']==row['local_id']),None)
+        if (message and not message.get('outgoing') and (message.get('type',0)&65535)==47
+                and message.get('sender')==job['person_id'] and message.get('timestamp')==row['ts']
+                and row['md5'] in message.get('sticker_hashes',[])):
+            store._write('INSERT OR REPLACE INTO sticker_source_evidence VALUES(?,?,?,?,?,?)',(library.account,job['username'],row['source'],row['local_id'],job['person_id'],row['id']))
+
+
+def continue_sticker_request(ui,reader,job,library,store,b,should_yield):
+    import sticker_commands
+    candidates=job.get('sticker_continue_candidates',[])
+    if not candidates:return sticker_commands.handle(job,library,store)
+    candidate=candidates[0];asset=library.get(candidate['id'])
+    messages=reader.messages(job['username'],limit=200,source=candidate['source'])
+    message=next((m for m in messages if m['local_id']==candidate['local_id']),None)
+    if (not asset or not message or message.get('outgoing') or message.get('sender')!=job['person_id']
+            or (message.get('type',0)&65535)!=47 or asset['md5'] not in message.get('sticker_hashes',[])):
+        return '未能重新核验该表情的原消息，尚未进行收藏。'
+    action=dict(job,batch=[dict(source=candidate['source'],message=message)])
+    result=sync_sticker(ui,reader,action,library,store,b,should_yield=should_yield)
+    status=sticker_commands.handle(job,library,store)
+    if result=='confirmed':return status+'刚才最新的这张已确认收藏；其余按各自状态核对。'
+    if result in ('sending','unconfirmed'):return status+'这张收藏结果尚未确认，不会重复点击。'
+    if result=='source_not_latest':return status+'该图已不是最新入站媒体，请重发后再收藏。'
+    return status+'本次尚未完成新的原生收藏。'
+
+
 def normalize_forget_messages(messages,b,cfg):
     result=[]
     for message in messages:
@@ -696,7 +766,7 @@ def prepare_model(job, reader, responder, vision_fn, b, cfg, people=None, sticke
             if health:health.note(job,'media','media_read')
             observed=people.observation(job['account'],job['username'],row['source'],message) if people else ''
             if caption_usable(observed):
-                if kind==47 and stickers:
+                if kind==47 and stickers and cfg['stickers'].get('collect_enabled',True):
                     try:collect_sticker(stickers,reader,job['username'],row,vision_fn)
                     except Exception as exc:LOG.warning('db_sticker_collect_failed=%s',type(exc).__name__)
                 parts.append('[过去已核验的本消息图片/表情观察：'+observed[:600]+']')
@@ -743,7 +813,7 @@ def prepare_model(job, reader, responder, vision_fn, b, cfg, people=None, sticke
                     description = vision_fn(paths, prompt) or ""
                     if people and caption_usable(description):
                         people.observe(job['account'],job['username'],row['source'],message,description,'original' if native else 'capture')
-                    if kind==47 and raw and stickers and description:
+                    if kind==47 and raw and stickers and description and cfg['stickers'].get('collect_enabled',True):
                         collect_sticker(stickers,reader,job['username'],row,vision_fn,raw=raw,paths=paths)
             except Exception as exc:
                 LOG.warning("db_media_failed=%s event=%s", type(exc).__name__, job["event_id"])
@@ -757,6 +827,16 @@ def prepare_model(job, reader, responder, vision_fn, b, cfg, people=None, sticke
                 if media_dir:
                     media_dir.cleanup()
             parts.append("[图片/表情内容：%s]" % (description[:600] or "未能读取，不要猜测内容"))
+        elif kind == 34:
+            import voice_input
+            transcript=voice_input.transcribe_message(reader,dict(message,account=job['account'],chat_username=job['username'],source=row['source']),cfg)
+            parts.append('[本条语音转写，可能有识别误差：'+transcript+']' if transcript else '[本条语音未能转写，不猜测内容]')
+            if transcript:
+                job['voice_transcribed']=True;job.pop('media_fallback',None)
+            if transcript and row is job.get('focus'):
+                job['focus_text']=transcript
+            if not transcript and not job.get('voice_transcribed') and all((r['message'].get('type',1)&65535)==34 for r in job['batch']):
+                job['media_fallback']='这条语音暂时未能转写，可以换段短语音或发文字给我。'
         elif kind == 1:
             parts.append(b.clean_db_text(own_text(message)))
         else:
@@ -772,7 +852,7 @@ def prepare_model(job, reader, responder, vision_fn, b, cfg, people=None, sticke
         job["message"] = b.build_batch_message(parts)
     if not cached:
         job['media_prepared']=True
-        if stickers and cfg['stickers'].get('prepare_before_reply') and not job.get('favorites_attempted') and stickers.pending_for(job):
+        if stickers and cfg['stickers'].get('collect_enabled',True) and cfg['stickers'].get('prepare_before_reply') and not job.get('favorites_attempted') and stickers.pending_for(job):
             return STICKER_MEDIA_READY
         if cfg['stickers'].get('capabilities_enabled'):job['sticker_capabilities']=sticker_capabilities(job,stickers,cfg)
     if not cached:
@@ -783,7 +863,7 @@ def prepare_model(job, reader, responder, vision_fn, b, cfg, people=None, sticke
             job['sticker_candidates']=stickers.candidates(job.get('message',''),job['username'],'sticker:'+job['event_id'],explicit=sticker_requested(job),frequency=cfg['stickers'])
     if health:health.note(job,'model','generating')
     model_started=time.monotonic()
-    reply = cached or job.get('memory_response') or responder(job)
+    reply = cached or job.get('memory_response') or job.get('media_fallback') or responder(job)
     if health:health.note(job,'ready','command' if job.get('memory_response') else 'waiting',duration_ms=(time.monotonic()-model_started)*1000)
     if not reply:
         raise RuntimeError("empty_reply")
@@ -897,6 +977,10 @@ def run(cfg, config_path=None):
     factory = lambda: b.wechat_db_module.WeChatDB(keys_file=cfg["storage"]["wcdb_keys"], cache_dir=cfg["storage"]["db_cache"])
     reader = factory()
     store = Store(cfg["memory"]["db"], cfg["memory"]["retention_days"])
+    from runtime_controls import RuntimeControls,is_command as owner_command
+    controls=RuntimeControls(store,reader.account)
+    base_cfg=copy.deepcopy(cfg)
+    cfg=controls.apply(base_cfg)
     people = People(store)
     from sticker_library import StickerLibrary
     stickers=StickerLibrary(store,cfg['stickers']['library_dir'],reader.account) if cfg['stickers']['enabled'] else None
@@ -913,8 +997,10 @@ def run(cfg, config_path=None):
     persona = {"text": b.settings.load_persona(cfg["persona_file"], b.agent.DEFAULT_PERSONA)}
     metrics = b.metrics_lib.Metrics(cfg["metrics"]["path"], cfg["metrics"]["enabled"])
     health=PipelineHealth(store,metrics)
-    tasks=Tasks(store) if cfg.get('tasks',{}).get('enabled') else None
+    tasks=Tasks(store) if cfg.get('tasks',{}).get('enabled') or cfg.get('followups',{}).get('enabled') else None
     if tasks:tasks.recover()
+    from followups import Followups
+    followups=Followups(store) if cfg.get('followups',{}).get('enabled') else None
     from feedback import Feedback
     feedback=Feedback(store) if cfg.get('learning',{}).get('enabled') else None
     semantic_selector=build_semantic_selector(cfg,api_key,store,b,metrics) if cfg['memory'].get('semantic_enabled') else None
@@ -922,7 +1008,7 @@ def run(cfg, config_path=None):
     vision_key = b.settings.read_api_key(cfg["vision"].get("key_file") or cfg["api"]["key_file"])
     vision_fn = (lambda paths, prompt: b.vision.describe(cfg["vision"], paths, vision_key, prompt=prompt)) if cfg["vision"]["enabled"] and vision_key else None
     from sticker_collect import CollectQueue
-    collection_queue=CollectQueue(store,reader.account) if stickers and vision_fn and cfg['stickers'].get('passive_collect') else None
+    collection_queue=CollectQueue(store,reader.account) if stickers and vision_fn else None
     def learn_person(reader,scene,messages,source):
         messages=normalize_forget_messages(messages,b,cfg)
         people.record(reader.account,scene['username'],scene['title'],messages,source,reader.contacts())
@@ -931,7 +1017,7 @@ def run(cfg, config_path=None):
                 person=message.get('sender','') if scene['username'].endswith('@chatroom') else scene['username']
                 forgotten=forget_request(own_text(message)) if not message.get('outgoing') and not message.get('quote_sender') and (message.get('type',1)&65535)==1 else ''
                 if person and forgotten:feedback.erase(reader.account,person,message.get('timestamp',time.time()),kind=forgotten)
-        if collection_queue:
+        if collection_queue and cfg['stickers'].get('collect_enabled',True) and cfg['stickers'].get('passive_collect'):
             for message in messages:collection_queue.enqueue(scene['username'],dict(source=source,message=message))
 
     ingestion = Reader(factory, inbox, cfg, lambda text: b.mentioned_self(text, b.policy_self_names(cfg)),on_messages=learn_person)
@@ -1011,14 +1097,17 @@ def run(cfg, config_path=None):
                         fresh = b.settings.load(config_file)
                         # Paths, account and transport settings require an explicit service restart.
                         for key in ("policy", "proactive", "moments", "delivery", "voice", "quality", "relay"):
-                            cfg[key] = fresh[key]
+                            base_cfg[key] = fresh[key]
                         persona["text"] = b.settings.load_persona(fresh["persona_file"], b.agent.DEFAULT_PERSONA)
                         config_mtime = b.file_mtime(config_file)
                         LOG.info("db_config_reloaded")
+                cfg=controls.apply(base_cfg)
+                ingestion.cfg=cfg
                 if now - last_purge >= 3600:
                     store.purge()
                     health.purge()
                     if feedback:feedback.purge(cfg['memory']['retention_days'])
+                    if followups:followups.purge()
                     inbox.purge(cfg["memory"]["retention_days"])
                     people.purge(cfg['memory']['retention_days'])
                     last_purge = now
@@ -1058,7 +1147,8 @@ def run(cfg, config_path=None):
                             reply = future.result()
                             if reply==STICKER_MEDIA_READY:
                                 job['favorites_attempted']=True
-                                try:sync_sticker(ui,reader,job,stickers,store,b,should_yield=lambda:sticker_should_yield(inbox,job))
+                                try:
+                                    if cfg['stickers'].get('collect_enabled',True):sync_sticker(ui,reader,job,stickers,store,b,should_yield=lambda:sticker_should_yield(inbox,job))
                                 except Exception as exc:LOG.warning('db_sticker_prepare_failed=%s',type(exc).__name__)
                                 futures[key]=(pool.submit(prepare_model,job,factory(),responder,vision_fn,b,copy.deepcopy(cfg),people,stickers,health,feedback,semantic_selector),job)
                                 continue
@@ -1072,6 +1162,8 @@ def run(cfg, config_path=None):
                 if ready:
                     job, reply = ready.pop(0)
                     active_job = job
+                    if job['kind']=='group' and cfg['policy'].get('group_strict_mention') and not job['is_mention']:
+                        job['skip_reason']='policy';store.mark_event(job['event_id']);complete(job,'done');continue
                     job["text_started"] = bool(store._rows("SELECT 1 FROM outbox WHERE session_key=? AND event_id LIKE ? LIMIT 1", (job["session_key"],job["event_id"] + ':part:%')))
                     stale=stale_group_reply(reader,job,b,cfg) or not semantic_reply_current(job,people)
                     if stale or b.is_silent_reply(reply) or (job.get("group_reply_mode") in ("proactive", "interject") and b.proactive_pass(reply)):
@@ -1086,7 +1178,7 @@ def run(cfg, config_path=None):
                             complete(job, "defer", wait)
                         else:
                             health.note(job,'sending','waiting')
-                            if stickers:
+                            if stickers and cfg['stickers'].get('collect_enabled',True):
                                 try:sync_sticker(ui,reader,job,stickers,store,b,should_yield=lambda:sticker_should_yield(inbox,job))
                                 except Exception as exc:LOG.warning('db_sticker_sync_failed=%s',type(exc).__name__)
                             if job.get('sticker_only'):
@@ -1116,7 +1208,10 @@ def run(cfg, config_path=None):
                 sticker_work=int(sticker_future is not None)
                 capacity = worker_count - len(futures) - len(ready)-sticker_work
                 for _ in range(max(0, capacity)):
-                    batch = inbox.claim(busy, account=reader.account)
+                    pacing={}
+                    if cfg['delivery'].get('coalesce_seconds',0)>0:
+                        pacing=dict(quiet_seconds=cfg['delivery']['coalesce_seconds'],max_wait_seconds=cfg['delivery'].get('max_coalesce_seconds',4),bypass_wait=lambda message:owner_command(own_text(message)))
+                    batch = inbox.claim(busy, account=reader.account,**pacing)
                     if not batch:
                         break
                     active_batch = batch
@@ -1160,6 +1255,8 @@ def run(cfg, config_path=None):
                     if is_group:
                         active,eligible=group_turn(job,reader.account,cfg['policy'],b,engaged,topics,now)
                         interject = eligible and b.should_interject(job, cfg, interjected, now,checked_map=interject_checked)
+                        if not group_reply_relevant(job,active,eligible,interject,cfg):
+                            job['skip_reason']='policy';store.mark_event(job['event_id']);complete(job,'done');continue
                     job["force_reply"] = bool(is_group and job["is_mention"])
                     job["group_reply_mode"] = "mention" if job["is_mention"] else "engaged" if active else "interject" if interject else "private" if not is_group else "skip"
                     ok, why = b.policy.allowed(cfg["policy"], dict(name=job["title"], kind=job["kind"], is_mention=job["is_mention"], engaged=active, interject=interject, group_reply_mode=job["group_reply_mode"]))
@@ -1176,9 +1273,13 @@ def run(cfg, config_path=None):
                         complete(job, "defer", 1)
                         break
                     job['self_names']=b.policy_self_names(cfg)
+                    owner=verified_management_owner(job,owners,cfg)
                     command_reply=None
                     if not batch[0].get('reply'):
-                        if tasks:command_reply=task_command_reply(tasks,job)
+                        command_reply=capability_reply(job,reader,store,cfg,controls,owner,stickers,followups)
+                        if job.get('sticker_continue_requested') and cfg['stickers'].get('collect_enabled',True):
+                            command_reply=continue_sticker_request(ui,reader,job,stickers,store,b,lambda:sticker_should_yield(inbox,job))
+                        if tasks and command_reply is None:command_reply=task_command_reply(tasks,job)
                         if command_reply is None and not job.get('quote_sender') and job['focus_text'].strip() in ('消息处理状态','运行状态'):
                             command_reply=health.report(job)
                     if command_reply is not None:
@@ -1188,7 +1289,7 @@ def run(cfg, config_path=None):
                         health.note(job,'ready','command')
                         active_job=active_batch=None
                         continue
-                    choose_command(job, b, cfg, owners.get(job["username"]) in {t.casefold() for t in cfg["relay"]["allowed_titles"]})
+                    choose_command(job, b, cfg, owners.get(job['username']) in {t.casefold() for t in cfg['relay']['allowed_titles']})
                     if job["command"]:
                         if not select_chat(ui, reader, job, b):
                             complete(job, "retry")
@@ -1206,13 +1307,13 @@ def run(cfg, config_path=None):
                         if job.get('group_reply_mode')=='interject':interject_checked[job['identity']]=time.monotonic()
                         futures[job["username"]] = (pool.submit(prepare_model, job, factory(), responder, vision_fn, b, copy.deepcopy(cfg), people, stickers,health,feedback,semantic_selector), job)
                         active_job = active_batch = None
-                if collection_queue and sticker_future is None and worker_count-len(futures)-len(ready)>=2 and not inbox.count(reader.account,min_priority=3):
+                if collection_queue and cfg['stickers'].get('collect_enabled',True) and cfg['stickers'].get('passive_collect') and sticker_future is None and worker_count-len(futures)-len(ready)>=2 and not inbox.count(reader.account,min_priority=3):
                     collection_job=collection_queue.claim(set(futures)|{j['username'] for j,_ in ready})
                     if collection_job:sticker_future=(pool.submit(collect_queued_sticker,collection_job,factory(),stickers,vision_fn),collection_job)
                 urgent_busy=any(j['kind']=='private' or j.get('is_mention') for _,j in futures.values()) or any(j['kind']=='private' or j.get('is_mention') for j,_ in ready)
                 if tasks and not urgent_busy and now-last_task_attempt>=5 and time.monotonic()-ingestion.last_ok<5:
                     last_task_attempt=now
-                    run_due_task(ui,reader,tasks,store,inbox,b,cfg,health=health)
+                    run_due_task(ui,reader,tasks,store,inbox,b,cfg,health=health,followups=followups)
                 if stickers and cfg['stickers'].get('passive_collect') and not futures and not ready and not sticker_future and not inbox.count(reader.account) and now-last_sticker_maintenance>=15:
                     last_sticker_maintenance=now
                     try:maintain_native_stickers(ui,reader,stickers,store,b,favorite_attempts,now,lambda:stopped or bool(inbox.count(reader.account,min_priority=3)))

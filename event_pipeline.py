@@ -2,6 +2,7 @@
 import hashlib
 import json
 import logging
+import re
 import sqlite3
 import threading
 import time
@@ -33,6 +34,8 @@ class Inbox:
                 PRIMARY KEY(account, username));
             CREATE TABLE IF NOT EXISTS inbox_bootstrap(account TEXT PRIMARY KEY, started REAL NOT NULL);
         """)
+        if 'received_at' not in {row[1] for row in self.db.execute('PRAGMA table_info(inbox)')}:
+            self.db.execute('ALTER TABLE inbox ADD COLUMN received_at REAL NOT NULL DEFAULT 0')
 
     def cursor(self, account, username, source):
         with self.lock:
@@ -55,10 +58,10 @@ class Inbox:
                 if not message.get("outgoing") and message.get("timestamp", 0) >= minimum_timestamp:
                     event = hashlib.sha256(f"{account}\0{username}\0{source}\0{local}".encode()).hexdigest()[:32]
                     result = self.db.execute(
-                        "INSERT OR IGNORE INTO inbox(event_id,account,username,source,local_id,title,payload,priority,ts) "
-                        "VALUES(?,?,?,?,?,?,?,?,?)", (event, account, username, source, local, title,
+                        "INSERT OR IGNORE INTO inbox(event_id,account,username,source,local_id,title,payload,priority,ts,received_at) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?)", (event, account, username, source, local, title,
                                                       payload, priority(message) if callable(priority) else priority,
-                                                      message.get("timestamp", 0)))
+                                                      message.get("timestamp", 0), time.time()))
                     inserted += result.rowcount
             latest = max([cursor] + [int(m["local_id"]) for m in messages])
             self.db.execute("INSERT INTO inbox_cursor VALUES(?,?,?,?,?) ON CONFLICT(account,username,source) "
@@ -71,7 +74,7 @@ class Inbox:
             return self.db.execute("SELECT COUNT(*) FROM inbox WHERE state IN ('pending','processing') "
                                    "AND (? IS NULL OR account=?) AND priority>=?", (account, account, min_priority)).fetchone()[0]
 
-    def claim(self, busy, now=None, limit=6, account=None):
+    def claim(self, busy, now=None, limit=6, account=None, *, quiet_seconds=0, max_wait_seconds=4, bypass_wait=None):
         now = time.time() if now is None else now
         with self.lock, self.db:
             # The head gates each chat; a later arrival cannot jump over its retrying predecessor.
@@ -79,24 +82,33 @@ class Inbox:
                 (SELECT 1 FROM inbox p WHERE p.account=i.account AND p.username=i.username
                  AND p.state IN ('pending','processing') AND (p.ts<i.ts OR (p.ts=i.ts AND p.rowid<i.rowid)))
                 ORDER BY priority DESC, ts DESC""", (account, account)).fetchall()
-            head = next((r for r in heads if r["username"] not in busy and r["due"] <= now), None)
-            if head is None:
-                return None
-            rows = self.db.execute("SELECT rowid,* FROM inbox WHERE account=? AND username=? AND state='pending' "
+            for head in heads:
+                if head['username'] in busy or head['due'] > now:
+                    continue
+                rows = self.db.execute("SELECT rowid,* FROM inbox WHERE account=? AND username=? AND state='pending' "
                                    "ORDER BY ts,rowid LIMIT ?", (head["account"], head["username"], limit)).fetchall()
-            batch = []
-            for row in rows:
-                if row["due"] > now:
-                    break
-                item = dict(row)
-                item["message"] = json.loads(item.pop("payload"))
-                batch.append(item)
+                batch = []
+                for row in rows:
+                    if row["due"] > now or (row['batch_id'] and row['batch_id'] != head['batch_id']):
+                        break
+                    item = dict(row)
+                    item["message"] = json.loads(item.pop("payload"))
+                    if (batch and not head['batch_id'] and (quiet_seconds > 0 or head['username'].endswith('@chatroom'))
+                            and item['message'].get('sender') != batch[0]['message'].get('sender')):
+                        break
+                    batch.append(item)
+                immediate = quiet_seconds > 0 and any(self._bypass_pacing(item['message'], head['account'], bypass_wait) for item in batch)
+                # Old backlog keeps its source age; future source clocks use durable local arrival.
+                first = min(head['received_at'], head['ts'])
+                last = max(item['received_at'] for item in batch)
+                if (quiet_seconds > 0 and not head['batch_id'] and head['received_at'] > 0
+                        and not immediate and len(batch) < limit and len(batch) == len(rows)
+                        and now < min(last + quiet_seconds, first + max_wait_seconds)):
+                    continue
+                break
+            else:
+                return None
             batch_id = head["batch_id"] or hashlib.sha256("\0".join(r["event_id"] for r in batch).encode()).hexdigest()[:16]
-            if head['username'].endswith('@chatroom') and not head['batch_id']:
-                speaker=batch[0]['message'].get('sender')
-                stop=next((index for index,item in enumerate(batch) if item['message'].get('sender')!=speaker),len(batch))
-                batch=batch[:stop]
-                batch_id=hashlib.sha256('\0'.join(r['event_id'] for r in batch).encode()).hexdigest()[:16]
             # A saved draft must keep its original batch boundary on retry.
             if head["batch_id"]:
                 batch = [r for r in batch if r["batch_id"] == head["batch_id"]]
@@ -105,6 +117,19 @@ class Inbox:
                 self.db.execute("UPDATE inbox SET state='processing', batch_id=? WHERE event_id=?",
                                 (batch_id, item["event_id"]))
             return batch
+
+    @staticmethod
+    def _bypass_pacing(message, account, predicate):
+        if message.get('quote_sender') == account:
+            return True
+        if (message.get('type', 1) & 65535) != 1:
+            return False
+        # Only the author's current text is inspected; quoted bodies never become commands.
+        from conversation_memory import own_text
+        text = own_text(message).strip().rstrip('。！!？?')
+        return (bool(re.search(r'@[^\s@，,：:]+', text))
+                or bool(re.fullmatch(r'(?:停止|停下|别发了|先别发|不要发了|暂停|取消|紧急|急|stop|cancel|消息处理状态|运行状态)', text, re.I))
+                or bool(predicate and predicate(message)))
 
     def save_reply(self, batch, reply):
         with self.lock, self.db:

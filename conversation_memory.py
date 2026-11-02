@@ -84,6 +84,7 @@ def group_transcript(reader,job,names,people=None):
         messages.extend(dict(row,source=source,timestamp=batch_stamps.get((source,row['local_id']),row['timestamp'])) for row in rows if row['local_id']<=end)
     messages.sort(key=lambda row:(row['timestamp'],row['local_id']))
     lines=[]
+    recent=[]
     for row in messages[-60:]:
         if people and not people.source_valid(job['account'],job['username'],row['source'],row,now=now):
             continue
@@ -93,6 +94,9 @@ def group_transcript(reader,job,names,people=None):
                 continue
         label=speaker_label(job['account'],row.get('sender',''),names)
         kind=row.get('type',1)&65535
+        recent.append(dict(source=row['source'],local_id=row['local_id'],sender=row.get('sender',''),
+                           text=own_text(row)[:1000] if kind==1 else '',quote_sender=row.get('quote_sender',''),
+                           timestamp=row.get('timestamp',0),outgoing=row.get('outgoing',False)))
         if kind==1:text=own_text(row)
         else:
             observation=people.observation(job['account'],job['username'],row['source'],row) if people else ''
@@ -102,30 +106,79 @@ def group_transcript(reader,job,names,people=None):
             quote_time='（原消息 '+source_time(quoted_at)+'）' if quoted_at is not None else '（原消息时间未核验）'
             text='引用 '+speaker_label(job['account'],row['quote_sender'],names)+quote_time+' 的话 '+json.dumps(row.get('quote_text','')[:120],ensure_ascii=False)+'；本人说：'+text
         lines.append('['+label+' | '+source_time(row.get('timestamp',0))+'] '+text[:350])
+    job['group_recent_sources']=recent
     return '\n'.join(lines)[-7000:]
+
+
+def group_addressee(job,account):
+    """Use explicit source addressing, never infer a member from their interests."""
+    if job.get('is_mention') or job.get('quote_sender')==account:
+        return account
+    if job.get('quote_sender'):
+        return job['quote_sender']
+    if (job.get('focus',{}).get('message',{}).get('type',1)&65535)!=1:return ''
+    text=job.get('focus_text','').strip()
+    names=job.get('sender_names',{})
+    mention=re.search(r'@[^\s@，,：:？?。！!]+',text)
+    if mention:
+        matches=[person for person,name in names.items() if name==mention.group(0)[1:]]
+        return matches[0] if len(matches)==1 else mention.group(0)
+    # shortcut: untagged names count only as an exact vocative followed by punctuation/space.
+    for person,name in names.items():
+        if person!=account and name and re.match(re.escape(str(name))+r'[，,：:\s]',text):
+            return person
+    return ''
+
+
+def group_source_terms(job,b):
+    text='\n'.join(own_text(row['message']) for row in job.get('batch',[])
+                   if row['message'].get('sender')==job['person_id']
+                   and (row['message'].get('type',1)&65535)==1)
+    return b.message_terms(text if job.get('batch') else job['focus_text'])
 
 
 def group_turn(job,account,policy,b,engaged,topics,now):
     key=(job['username'],job['person_id'])
     focused=job['focus_text']
-    if job['is_mention']:
+    media_followup=bool(any((r['message'].get('type',1)&65535) in (3,34,47) for r in job.get('batch',[]))
+                        and 0<=now-(engaged.get(key,0)-policy['group_engaged_seconds'])<=30)
+    destination=group_addressee(job,account)
+    if destination==account:
         engaged[key]=now+policy['group_engaged_seconds']
-        topics[key]=b.message_terms(focused)
-    quoted_elsewhere=bool(job.get('quote_sender') and job['quote_sender']!=account)
-    other_mention=bool(re.search(r'@[^\s@，,：:]+',focused)) and not job['is_mention']
-    if (quoted_elsewhere or other_mention) and not job['is_mention']:
+        topics[key]=group_source_terms(job,b)
+        return True,False
+    if destination:
+        engaged.pop(key,None)
+        topics.pop(key,None)
         return False,False
     followup=bool(re.fullmatch(r'(?:那|所以|然后)?(?:为什么|为啥|怎么说|什么意思|还有呢|后来呢|你觉得呢|真的吗|是吗|然后呢)(?:呢|啊|呀)?[？?！!。]*',focused.strip()))
-    active=now<engaged.get(key,0) and (b.related_to_topic(topics.get(key,set()),focused) or followup)
+    focus=job.get('focus',{})
+    stamp=focus.get('message',{}).get('timestamp')
+    prior=[row for row in job.get('group_recent_sources',[]) if not
+           (row['source']==focus.get('source') and row['local_id']>=focus.get('message',{}).get('local_id',float('inf')))
+           and (stamp is None or 0<=stamp-row['timestamp']<=policy['group_engaged_seconds'])]
+    if (followup or media_followup) and prior:
+        previous=prior[-1]
+        previous_target=group_addressee(dict(focus_text=previous['text'],quote_sender=previous.get('quote_sender',''),
+                                            sender_names=job.get('sender_names',{})),account)
+        if (previous.get('sender') not in (account,job['person_id']) and previous_target==job['person_id']) or (
+                previous.get('sender')==job['person_id'] and previous_target and previous_target!=account):
+            engaged.pop(key,None)
+            topics.pop(key,None)
+            return False,False
+    terms=topics.get(key,set())
+    active=now<engaged.get(key,0) and ((bool(terms) and b.related_to_topic(terms,focused)) or followup or media_followup)
     return active,not job['is_mention'] and not active
 
 
 def group_focus(job,account,names):
     target=speaker_label(account,job['person_id'],names)
     quoted=job.get('quote_sender','')
-    destination='小i' if job['is_mention'] else speaker_label(account,quoted,names) if quoted else '未明确'
+    destination=group_addressee(dict(job,sender_names=names),account)
+    destination=speaker_label(account,destination,names) if destination and not destination.startswith('@') else destination or '未明确'
     return ('本轮发言人：'+target+'；明确对话对象：'+destination+'；引用来源：'+(speaker_label(account,quoted,names) if quoted else '无')+'。\n'
             '先理解当前话题、已确定的安排和谁在问谁，再回应该发言人的本轮问题；群聊记录里的其他话题是背景，引用内容不等于本人观点。'
+            '只把本群近期有来源的成员原话作为话题依据，不从机器人回复扩展话题，不推测身份或带入私聊详情。'
             '对象未明确且没有具体补充时沉默，不替其他成员回答。')
 
 
@@ -133,7 +186,7 @@ def remember_group_reply(job,reply,policy,b,engaged,topics,interjected,now):
     if job.get('kind')!='group':return
     key=(job['username'],job['person_id'])
     engaged[key]=now+policy['group_engaged_seconds']
-    topics[key]=b.message_terms(job['focus_text']+'\n'+reply)
+    topics[key]=group_source_terms(job,b)
     if job.get('group_reply_mode')=='interject':interjected[job['identity']]=now
 
 

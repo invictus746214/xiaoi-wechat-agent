@@ -85,10 +85,10 @@ class GroupContextUpgradeTests(unittest.TestCase):
     def test_only_actual_group_reply_updates_speaking_and_engagement(self):
         from conversation_memory import remember_group_reply
         cfg=settings.normalize({});engaged={};topics={};sent={}
-        job=dict(kind='group',username='room',identity='room',person_id='a',focus_text='猫',group_reply_mode='interject')
+        job=dict(kind='group',username='room',identity='room',person_id='a',focus_text='猫咪',group_reply_mode='interject')
         remember_group_reply(job,'猫可以吃这个',cfg['policy'],bridge,engaged,topics,sent,1000)
         self.assertEqual(sent['room'],1000);self.assertGreater(engaged['room','a'],1000)
-        self.assertIn('猫可',topics['room','a'])
+        self.assertIn('猫咪',topics['room','a']);self.assertNotIn('猫可',topics['room','a'])
 
     def test_full_api_payload_retains_group_background_and_current_question(self):
         cfg=settings.normalize({'tools':{'enabled':False},'memory':{'summary_every':0}})

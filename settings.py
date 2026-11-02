@@ -42,6 +42,7 @@ DEFAULTS = {
         "timeout": 8,
     },
     "runtime": {
+        "owner_ids": [],
         "database_pipeline": False,
         "config_reload_seconds": 10,
         "purge_check_minutes": 30,
@@ -50,6 +51,7 @@ DEFAULTS = {
     },
     "tools": {"enabled": True, "max_rounds": 2},
     "policy": {
+        "group_strict_mention": False,
         "quiet_hours": [],
         "group_mention_only": False,
         "group_mention_reply": True,
@@ -118,9 +120,13 @@ DEFAULTS = {
         "max_chars": 140,
         "allow_private_only": False,
     },
+    "voice_input": {"enabled":False,"model_path":"/var/lib/wechat-autoreply/asr/vosk-model-small-cn-0.22","python_executable":"","timeout":15,"max_seconds":60},
+    "followups": {"enabled":False},
     "relay": {"enabled": False, "allowed_titles": []},
     "stickers": {"enabled": False, "auto_send": False, "library_dir": "/var/lib/wechat-autoreply/stickers", "send_probability":.3,"min_interval_seconds":600,"same_sticker_interval_seconds":86400,"passive_collect":False,"prepare_before_reply":False,"capabilities_enabled":False},
     "delivery": {
+        "coalesce_seconds": 0,
+        "max_coalesce_seconds": 4,
         "split_enabled": True,
         "split_threshold": 25,
         "split_target": 30,
@@ -224,6 +230,16 @@ def normalize(raw):
     config['stickers']['send_probability']=_probability(config['stickers'].get('send_probability'),.3)
     config['stickers']['min_interval_seconds']=_positive_int(config['stickers'].get('min_interval_seconds'),600,10,86400)
     config['stickers']['same_sticker_interval_seconds']=_positive_int(config['stickers'].get('same_sticker_interval_seconds'),86400,60,86400)
+    config['stickers']['collect_enabled']=bool(config['stickers'].get('collect_enabled',True))
+    config['policy']['group_strict_mention']=bool(config['policy'].get('group_strict_mention',False))
+    config['runtime']['owner_ids']=_string_list(config['runtime'].get('owner_ids'))
+    for key,default,maximum in (('coalesce_seconds',0,3),('max_coalesce_seconds',4,6)):
+        try:value=float(config['delivery'].get(key,default))
+        except (ValueError,TypeError):value=default
+        config['delivery'][key]=max(0,min(maximum,value)) if math.isfinite(value) else default
+    config['voice_input']['enabled']=bool(config['voice_input'].get('enabled',False))
+    config['voice_input']['timeout']=_positive_int(config['voice_input'].get('timeout'),15,1,15)
+    config['voice_input']['max_seconds']=_positive_int(config['voice_input'].get('max_seconds'),60,1,60)
     try:
         probability = float(config["policy"].get("group_interject_probability", 0.08))
     except (TypeError, ValueError):

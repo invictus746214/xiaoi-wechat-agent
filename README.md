@@ -77,6 +77,8 @@ python -m unittest discover -s . -p 'test_*.py'
 
 ## 继续开发
 
+- [六项能力的配置与微信指令](docs/SIX_CAPABILITIES_USAGE.md)
+
 - [文件地图、关键约束与待办](docs/HANDOFF.md)
 - [部署、配置与回滚](docs/DEPLOYMENT.md)
 - `SOURCE_SHA256.json`：整理时服务器运行模块的 SHA-256，便于核对源码来源。

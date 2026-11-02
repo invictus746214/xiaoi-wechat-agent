@@ -34,7 +34,8 @@
     "config_reload_seconds": 10,
     "purge_check_minutes": 30,
     "reply_unread_on_start": false,
-    "catch_up_on_start": false
+    "catch_up_on_start": false,
+    "owner_ids": []
   },
   "tools": {
     "enabled": true,
@@ -61,7 +62,8 @@
       "File Transfer",
       "文件传输助手"
     ],
-    "daily_reply_cap": 0
+    "daily_reply_cap": 0,
+    "group_strict_mention": false
   },
   "proactive": {
     "enabled": false,
@@ -140,7 +142,8 @@
     "same_sticker_interval_seconds": 86400,
     "passive_collect": false,
     "prepare_before_reply": false,
-    "capabilities_enabled": false
+    "capabilities_enabled": false,
+    "collect_enabled": true
   },
   "delivery": {
     "split_enabled": true,
@@ -151,6 +154,18 @@
     "max_per_minute": 6,
     "max_per_10min": 30,
     "private_min_interval_seconds": 1,
-    "group_min_interval_seconds": 15
+    "group_min_interval_seconds": 15,
+    "coalesce_seconds": 1.2,
+    "max_coalesce_seconds": 4
+  },
+  "voice_input": {
+    "enabled": false,
+    "model_path": "/var/lib/wechat-autoreply/asr/vosk-model-small-cn-0.22",
+    "python_executable": "/opt/wechat-autoreply/.venv-speech/bin/python",
+    "timeout": 15,
+    "max_seconds": 60
+  },
+  "followups": {
+    "enabled": false
   }
 }
