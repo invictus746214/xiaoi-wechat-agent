@@ -1,4 +1,6 @@
 import hashlib
+import inspect
+import io
 import json
 from pathlib import Path
 import sqlite3
@@ -40,7 +42,72 @@ class VoiceInputTests(unittest.TestCase):
             return sqlite3.connect((self.root/name).as_uri()+'?mode=ro', uri=True)
         self.reader = SimpleNamespace(account='self', db_dir=self.root,
                                       keys={'message/media_0.db': {}}, _connect=connect)
-        self.cfg = {'voice_input': {'enabled': True}}
+        self.model = self.root/'model'
+        for name in ('am/final.mdl', 'conf/model.conf', 'graph/HCLr.fst', 'graph/Gr.fst'):
+            target = self.model/name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b'model fixture')
+        self.cfg = {'voice_input': {'enabled': True, 'model_path': str(self.model)}}
+
+    def test_transcription_does_not_spawn_a_redundant_dependency_probe(self):
+        result = SimpleNamespace(returncode=0, stdout=b'{"text":"verified"}')
+        with patch('voice_input.subprocess.run', return_value=result) as run:
+            self.assertEqual(voice_input.transcribe_message(self.reader, self.message, self.cfg), 'verified')
+        self.assertEqual(run.call_count, 1)
+        self.assertIn('input', run.call_args.kwargs)
+
+    def test_model_or_account_change_never_reuses_old_availability_or_source(self):
+        result = SimpleNamespace(returncode=0, stdout=b'{"text":"verified"}')
+        with patch('voice_input.subprocess.run', return_value=result) as run:
+            self.assertEqual(voice_input.transcribe_message(self.reader, self.message, self.cfg), 'verified')
+            (self.model/'am/final.mdl').unlink()
+            self.assertEqual(voice_input.transcribe_message(self.reader, self.message, self.cfg), '')
+            self.reader.account = 'other'
+            self.assertEqual(voice_input.transcribe_message(self.reader, self.message, self.cfg), '')
+        self.assertEqual(run.call_count, 1)
+
+    def test_phase_callback_receives_only_fixed_names_and_durations(self):
+        self.assertIn('phase_callback', inspect.signature(voice_input.transcribe_message).parameters)
+        phases = []
+        def worker(args, **kwargs):
+            (Path(args[-1])/'phases.json').write_text('{"imports":0.1,"decode":0.2,"model":0.3,"recognition":0.4}')
+            return SimpleNamespace(returncode=0, stdout=b'{"text":"private transcript"}')
+        with patch('voice_input.subprocess.run', side_effect=worker):
+            self.assertEqual(voice_input.transcribe_message(self.reader, self.message, self.cfg,
+                phase_callback=lambda name, duration: phases.append((name, duration))), 'private transcript')
+        self.assertEqual({name for name, _ in phases},
+            {'native_read', 'available_probe', 'imports', 'decode', 'model', 'recognition', 'worker', 'total'})
+        self.assertTrue(all(type(duration) is float and duration >= 0 for _, duration in phases))
+
+    def test_timeout_keeps_completed_phases_and_callback_failure_cannot_break_asr(self):
+        self.assertIn('phase_callback', inspect.signature(voice_input.transcribe_message).parameters)
+        phases = []
+        def timeout(args, **kwargs):
+            (Path(args[-1])/'phases.json').write_text('{"decode":0.2}')
+            raise subprocess.TimeoutExpired(args, 15)
+        with patch('voice_input.subprocess.run', side_effect=timeout):
+            self.assertEqual(voice_input.transcribe_message(self.reader, self.message, self.cfg,
+                phase_callback=lambda name, duration: phases.append((name, duration))), '')
+        self.assertIn(('decode', 0.2), phases)
+        self.assertEqual({name for name, _ in phases}, {'native_read', 'available_probe', 'decode', 'worker', 'total'})
+        def broken(name, duration):
+            raise RuntimeError('diagnostics failed')
+        with patch('voice_input.subprocess.run', return_value=SimpleNamespace(returncode=0, stdout=b'{"text":"verified"}')):
+            self.assertEqual(voice_input.transcribe_message(self.reader, self.message, self.cfg, phase_callback=broken), 'verified')
+
+    def test_untrusted_worker_phase_metadata_is_bounded_and_validated(self):
+        self.assertIn('phase_callback', inspect.signature(voice_input.transcribe_message).parameters)
+        for payload in ('{"private words":1}', '{"decode":NaN}', '{"model":-1}', '{"decode":16}',
+                        '{"decode":'+ '9'*1000 +'}', '['*1010+'0'+']'*1010, 'x'*2049):
+            with self.subTest(payload=payload[:30]):
+                phases = []
+                def worker(args, **kwargs):
+                    (Path(args[-1])/'phases.json').write_text(payload)
+                    return SimpleNamespace(returncode=0, stdout=b'{"text":"verified"}')
+                with patch('voice_input.subprocess.run', side_effect=worker):
+                    self.assertEqual(voice_input.transcribe_message(self.reader, self.message, self.cfg,
+                        phase_callback=lambda name, duration: phases.append((name, duration))), 'verified')
+                self.assertEqual({name for name, _ in phases}, {'native_read', 'available_probe', 'worker', 'total'})
 
     def test_disabled_never_opens_database_or_worker(self):
         self.assertEqual(voice_input.transcribe_message(self.reader, self.message, {}), '')
@@ -51,15 +118,13 @@ class VoiceInputTests(unittest.TestCase):
                         {'source': '../other.db'}, {'server_id': '0'},
                         {'server_id': '-1'}, {'sender': 'other'}, {'timestamp': 11},
                         {'chat_username': 'other'}, {'local_id': 8}):
-            with self.subTest(changes=changes), patch('voice_input.available', return_value=True), \
-                    patch('voice_input.subprocess.run') as run:
+            with self.subTest(changes=changes), patch('voice_input.subprocess.run') as run:
                 self.assertEqual(voice_input.transcribe_message(self.reader, {**self.message, **changes}, self.cfg), '')
                 run.assert_not_called()
 
     def test_verified_silk_is_passed_only_to_local_bounded_worker(self):
         result = SimpleNamespace(returncode=0, stdout=json.dumps({'text': '你好'}).encode())
-        with patch('voice_input.available', return_value=True), \
-                patch('voice_input.subprocess.run', return_value=result) as run:
+        with patch('voice_input.subprocess.run', return_value=result) as run:
             self.assertEqual(voice_input.transcribe_message(self.reader, self.message, self.cfg), '你好')
         self.assertEqual(run.call_args.kwargs['input'], self.raw)
         self.assertEqual(run.call_args.kwargs['timeout'], 15)
@@ -74,7 +139,7 @@ class VoiceInputTests(unittest.TestCase):
                     db.execute('INSERT INTO VoiceInfo VALUES(1,7,1234,10,?)', (payload,))
                     if duplicate:
                         db.execute('INSERT INTO VoiceInfo VALUES(1,7,1234,10,?)', (payload,))
-                with patch('voice_input.available', return_value=True), patch('voice_input.subprocess.run') as run:
+                with patch('voice_input.subprocess.run') as run:
                     self.assertEqual(voice_input.transcribe_message(self.reader, self.message, self.cfg), '')
                     run.assert_not_called()
 
@@ -82,10 +147,9 @@ class VoiceInputTests(unittest.TestCase):
         for result in (SimpleNamespace(returncode=1, stdout=b''),
                        SimpleNamespace(returncode=0, stdout=b'not json'),
                        SimpleNamespace(returncode=0, stdout=b'{"text":42}')):
-            with patch('voice_input.available', return_value=True), patch('voice_input.subprocess.run', return_value=result):
+            with patch('voice_input.subprocess.run', return_value=result):
                 self.assertEqual(voice_input.transcribe_message(self.reader, self.message, self.cfg), '')
-        with patch('voice_input.available', return_value=True), \
-                patch('voice_input.subprocess.run', side_effect=subprocess.TimeoutExpired('worker', 15)):
+        with patch('voice_input.subprocess.run', side_effect=subprocess.TimeoutExpired('worker', 15)):
             self.assertEqual(voice_input.transcribe_message(self.reader, self.message, self.cfg), '')
 
     def test_timeout_cleans_parent_owned_scratch_and_worker_uses_one_thread(self):
@@ -97,7 +161,7 @@ class VoiceInputTests(unittest.TestCase):
             self.assertEqual(kwargs['env']['OMP_NUM_THREADS'], '1')
             self.assertEqual(kwargs['env']['OPENBLAS_NUM_THREADS'], '1')
             raise subprocess.TimeoutExpired(args, 15)
-        with patch('voice_input.available', return_value=True), patch('voice_input.subprocess.run', side_effect=timeout):
+        with patch('voice_input.subprocess.run', side_effect=timeout):
             self.assertEqual(voice_input.transcribe_message(self.reader, self.message, self.cfg), '')
         self.assertEqual(len(directories), 1)
         self.assertFalse(directories[0].exists())
@@ -150,6 +214,32 @@ class VoiceInputTests(unittest.TestCase):
         with patch('voice_input.Path.read_text',return_value='VmRSS: 250000 kB\n'),patch('voice_input.os._exit') as exited:
             voice_input._memory_watchdog(stop)
         exited.assert_not_called()
+
+    def test_worker_preserves_resource_isolation_and_writes_only_phase_metadata(self):
+        resource = SimpleNamespace(RLIMIT_AS=1, RLIMIT_CPU=2, RLIMIT_FSIZE=3, RLIMIT_CORE=4,
+                                   setrlimit=unittest.mock.Mock())
+        def recognize(raw, model, seconds, scratch, callback):
+            self.assertEqual(raw, self.raw)
+            for name in ('imports', 'decode', 'model', 'recognition'):
+                callback(name, 0.1)
+            return 'private transcript'
+        output = io.BytesIO()
+        with patch.dict('sys.modules', {'resource': resource}), \
+                patch('voice_input.sys.argv', ['worker', str(self.model), '60', str(self.root)]), \
+                patch('voice_input.sys.stdin', SimpleNamespace(buffer=io.BytesIO(self.raw))), \
+                patch('voice_input.sys.stdout', SimpleNamespace(buffer=output)), \
+                patch('voice_input.threading.Thread'), patch('voice_input.os.umask'), \
+                patch('voice_input._recognize', side_effect=recognize):
+            voice_input._worker()
+        self.assertEqual(resource.setrlimit.call_args_list, [
+            unittest.mock.call(1, (2048*1024**2, 2048*1024**2)),
+            unittest.mock.call(2, (12, 12)),
+            unittest.mock.call(3, (60*16000*2, 60*16000*2)),
+            unittest.mock.call(4, (0, 0))])
+        self.assertEqual(voice_input.MAX_RSS_KIB, 384*1024)
+        self.assertEqual(json.loads((self.root/'phases.json').read_text()),
+                         {name: 0.1 for name in ('imports', 'decode', 'model', 'recognition')})
+        self.assertEqual(json.loads(output.getvalue()), {'text': 'private transcript'})
 
 
 if __name__ == '__main__':

@@ -2,7 +2,10 @@
 import hashlib
 import ctypes as ct
 import io
+import json
+import math
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import time
 
@@ -315,4 +318,169 @@ class NativeStickers:
             for native,aliases in self.favorite_records():
                 if digest in aliases or native in hashes:return native
             time.sleep(.25)
+        return 'unconfirmed'
+
+    def _history_scrollbar(self,bounds,deadline):
+        root=getattr(self.ui.right_list,'parent',None)
+        if root is None:return None
+        found=[]
+        for index,obj in enumerate(self.b.moments.walk(root,300)):
+            if self.should_yield() or time.monotonic()>=deadline:return None
+            try:
+                if obj.getRoleName() not in ('scroll bar','scrollbar') or not obj.getState().contains(self.ui.pyatspi.STATE_SHOWING):continue
+                rect=self.b.component_rect(obj,self.ui.pyatspi)
+                if not (0<rect.width<=30 and rect.height>=bounds.height*.5 and
+                        abs(rect.x-(bounds.x+bounds.width))<=30 and abs(rect.y-bounds.y)<=30):continue
+                value=obj.queryValue();current=float(value.currentValue);maximum=float(value.maximumValue)
+                minimum=float(value.minimumValue)
+                if all(math.isfinite(n) for n in (current,maximum,minimum)) and minimum<=current<=maximum:
+                    found.append((current,maximum))
+            except Exception:continue
+        return found[0] if len(found)==1 else None
+
+    def _history_text_bottom(self,history,bounds):
+        latest=history[-1];text=latest.get('text','').strip()
+        if ((latest.get('type',0)&65535)!=1 or len(text)<4 or len(text)>=1000 or
+                sum(m.get('text','').strip()==text for m in history)!=1):return None
+        rows=[row for row in self.ui.rows(self.ui.right_list) if row[1].height>0 and
+            row[1].y<bounds.y+bounds.height and row[1].y+row[1].height>bounds.y]
+        matches=[row for row in rows if row[0].strip()==text and row[1].y>=bounds.y and
+            row[1].y+row[1].height<=bounds.y+bounds.height]
+        return (len(matches)==1 and matches[0][1].y==max((row[1].y for row in rows),default=-1) and
+            self.ui.incoming_state(matches[0][0],matches[0][1])==('outgoing' if latest.get('outgoing') else 'incoming'))
+
+    def favorite_source(self,asset,job,select_chat,before_submit):
+        """Find one verified old original; the caller persists only anchor/offset."""
+        if self.should_yield():return 'yield'
+        if self.reader.account!=job.get('account') or asset.get('account')!=self.reader.account:return 'account_unverified'
+        row=favorite_source(asset,job)
+        if row is None or row['message'].get('outgoing') is not False:return 'source_unverified'
+        digest=asset['md5'];source=row['source'];local_id=row['message']['local_id']
+        # shortcut: one bounded source shard; larger histories need a native message-id locator.
+        history=self.reader.messages(job['username'],limit=2001,source=source)
+        matches=[m for m in history if m.get('outgoing') is False and (m.get('type',0)&65535)==47 and digest in m.get('sticker_hashes',[])]
+        exact=[m for m in matches if m['local_id']==local_id]
+        if len(history)>=2001 or len(exact)!=1:return 'source_unverified'
+        media=[m for m in history if m.get('outgoing') is False and (m.get('type',0)&65535) in (3,47)]
+        if media[-1]['local_id']==local_id:return self.favorite_latest(asset,job,select_chat,before_submit)
+        if len(matches)!=1:return 'source_unverified'
+        hashes=exact[0]['sticker_hashes']
+        for native,aliases in self.favorite_records():
+            if digest in aliases or native in hashes:return native
+        latest=history[-1]
+        def message_anchor(message):
+            return hashlib.sha256(json.dumps([self.reader.account,job['username'],source,local_id,
+                message['local_id'],message.get('type'),message.get('timestamp'),message.get('server_id')],separators=(',',':')).encode()).hexdigest()
+        anchor=message_anchor(latest)
+        if job.get('history_anchor')!=anchor:job.update(history_anchor=anchor,history_offset=0)
+        offset=job.get('history_offset',0)
+        if type(offset) is not int or not 0<=offset<=64:job['history_offset']=offset=0
+        templates=self.templates(asset)
+        if self.should_yield():return 'yield'
+        if not select_chat(self.ui,self.reader,job,self.b):return 'chat_unverified'
+        deadline=time.monotonic()+4.5
+        session=self.b.wechat_session()
+        def guard():
+            selected,path=self.ui.selected_info()
+            return (self.reader.account==job['account'] and session and
+                focus_owned(self.ui.pointer(),session[0]) and bool(job.get('title')) and bool(selected) and
+                selected.splitlines()[0].strip()==job['title'] and path==job.get('path'))
+        def interrupted():
+            if self.should_yield():return 'yield'
+            if time.monotonic()>=deadline:return 'history_pending'
+            if not guard():return 'chat_unverified'
+            return None
+        bounds=self.b.component_rect(self.ui.right_list,self.ui.pyatspi)
+        pointer=self.ui.pointer()
+        pointer.move(bounds.x+bounds.width//2,bounds.y+bounds.height//2)
+        # An unchanged generic image label is not evidence that scrolling reached bottom.
+        for _ in range(48):
+            reason=interrupted()
+            if reason:return reason
+            position=self._history_scrollbar(bounds,deadline)
+            if position is None:
+                reason=interrupted()
+                if reason:return reason
+                bottom=self._history_text_bottom(history,bounds)
+                if bottom is None:return 'history_bottom_unverified'
+                if bottom:break
+            if position is not None and position[0]==position[1]:break
+            pointer.scroll(1)
+        else:return 'history_pending'
+        for _ in range(offset):
+            reason=interrupted()
+            if reason:return reason
+            pointer.scroll(1,up=True)
+        while offset<=64:
+            reason=interrupted()
+            if reason:return reason
+            boxes=[];images=[]
+            for name,rect,_obj in self.ui.rows(self.ui.right_list):
+                reason=interrupted()
+                if reason:return reason
+                if not (self.b.is_image_stub(name) and rect.y>=bounds.y and rect.y+rect.height<=bounds.y+bounds.height
+                        and self.ui.incoming_state(name,rect)=='incoming'):continue
+                box=self.b.image_capture_rect(self.ui,rect,job['kind']=='group')
+                if isinstance(box,tuple):box=SimpleNamespace(x=box[0],y=box[1],width=box[2],height=box[3])
+                if not (box.width>0 and box.height>0 and bounds.x<=box.x and bounds.y<=box.y and
+                        box.x+box.width<=bounds.x+bounds.width and box.y+box.height<=bounds.y+bounds.height):return 'source_image_unverified'
+                image=self.capture(box)
+                if image is None:return 'source_image_unverified'
+                boxes.append(box);images.append(image)
+            index=match_tile(templates,images,threshold=.04)
+            if index is None and any(match_tile(templates,[image],threshold=.04) is not None for image in images):return 'source_image_unverified'
+            if index is not None:
+                reason=interrupted()
+                if reason:return reason
+                fresh=self.reader.messages(job['username'],limit=1,source=source)
+                if not fresh or message_anchor(fresh[-1])!=anchor:
+                    job.update(history_anchor=message_anchor(fresh[-1]) if fresh else '',history_offset=0);return 'history_pending'
+                if not select_chat(self.ui,self.reader,job,self.b) or not guard():return 'chat_unverified'
+                image=self.capture(boxes[index])
+                if image is None or match_tile(templates,[image],threshold=.04) is None:return 'source_image_unverified'
+                reason=interrupted()
+                if reason:return reason
+                return self._favorite_history_bubble(boxes[index],digest,hashes,before_submit,interrupted,deadline)
+            offset+=1;job['history_offset']=min(offset,64)
+            if offset>64:return 'source_unverified'
+            position=self._history_scrollbar(bounds,deadline)
+            previous=position[0] if position is not None else None
+            reason=interrupted()
+            if reason:return reason
+            pointer.scroll(1,up=True)
+            reason=interrupted()
+            if reason:return reason
+            position=self._history_scrollbar(bounds,deadline)
+            if previous is not None and position is not None and position[0]==previous:return 'source_unverified'
+        return 'source_unverified'
+
+    def _favorite_history_bubble(self,box,digest,hashes,before_submit,interrupted,deadline):
+        pointer=self.ui.pointer();pointer.move(box.x+box.width//2,box.y+box.height//2)
+        pointer.xtst.XTestFakeButtonEvent(pointer.display,3,True,0)
+        pointer.xtst.XTestFakeButtonEvent(pointer.display,3,False,0)
+        pointer.x11.XFlush(pointer.display);time.sleep(.15)
+        def dismiss():
+            if self.ui.composer is not None:
+                rect=self.b.component_rect(self.ui.composer,self.ui.pyatspi)
+                pointer.tap(rect.x+rect.width-20,rect.y+15)
+        options=[]
+        for index,obj in enumerate(self.b.moments.walk(self.ui.app,15000)):
+            if index%25==0:
+                reason=interrupted()
+                if reason:dismiss();return reason
+            try:
+                if obj.getRoleName() in ('menu item','push button') and (obj.name or '').strip() in ('Add Sticker','Add to Stickers','Add to stickers','Add to Favorite Stickers','添加到表情','添加到我的表情') and obj.getState().contains(self.ui.pyatspi.STATE_SHOWING):
+                    options.append(self.b.component_rect(obj,self.ui.pyatspi))
+            except Exception:continue
+        if len(options)!=1:dismiss();return 'add_control_missing'
+        reason=interrupted()
+        if reason:dismiss();return reason
+        if not before_submit():dismiss();return 'yield'
+        # The submission guard durably marks uncertainty before this sole click.
+        self.b._click_rect(self.ui,options[0])
+        while time.monotonic()<deadline:
+            if self.should_yield():return 'unconfirmed'
+            for native,aliases in self.favorite_records():
+                if digest in aliases or native in hashes:return native
+            time.sleep(min(.15,max(0,deadline-time.monotonic())))
         return 'unconfirmed'

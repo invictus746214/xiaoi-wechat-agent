@@ -71,6 +71,10 @@ class StickerLibrary:
                 CREATE TABLE IF NOT EXISTS sticker_source_evidence(
                     account TEXT,scene TEXT,source TEXT,local_id INTEGER,sender TEXT,id TEXT,
                     PRIMARY KEY(account,scene,source,local_id));
+                CREATE TABLE IF NOT EXISTS sticker_favorite_progress(
+                    account TEXT,id TEXT,scene TEXT,source TEXT,local_id INTEGER,
+                    anchor TEXT,page_offset INTEGER,
+                    PRIMARY KEY(account,id,scene,source,local_id));
             ''')
 
     def items(self):
@@ -160,8 +164,26 @@ class StickerLibrary:
             if row['id'] in seen:continue
             seen.add(row['id'])
             message=dict(local_id=row['local_id'],type=47,outgoing=False,timestamp=row['ts'],sticker_hashes=[row['md5']])
-            jobs.append(dict(event_id='favorite:'+row['id'],asset_id=row['id'],account=self.account,username=row['scene'],kind='group' if row['scene'].endswith('@chatroom') else 'private',batch=[dict(source=row['source'],message=message)]))
+            progress=self.store._rows('SELECT anchor,page_offset FROM sticker_favorite_progress WHERE account=? AND id=? AND scene=? AND source=? AND local_id=?',
+                (self.account,row['id'],row['scene'],row['source'],row['local_id']))
+            jobs.append(dict(event_id='favorite:'+row['id'],asset_id=row['id'],account=self.account,username=row['scene'],kind='group' if row['scene'].endswith('@chatroom') else 'private',batch=[dict(source=row['source'],message=message)],
+                history_anchor=progress[0]['anchor'] if progress else '',history_offset=progress[0]['page_offset'] if progress else 0))
         return jobs
+
+    def save_favorite_progress(self,identifier,job):
+        anchor=job.get('history_anchor','');offset=job.get('history_offset',0)
+        if (job.get('account')!=self.account or not re.fullmatch('[a-f0-9]{64}',anchor)
+                or type(offset) is not int or not 0<=offset<=64):return
+        asset=self.get(identifier)
+        if asset is None:return
+        for row in job.get('batch',[]):
+            message=row['message']
+            if message.get('outgoing') is not False or (message.get('type',0)&65535)!=47 or asset['md5'] not in message.get('sticker_hashes',[]):continue
+            self.store._write('INSERT INTO sticker_favorite_progress SELECT account,id,scene,source,local_id,?,? FROM sticker_sources '
+                'WHERE account=? AND id=? AND scene=? AND source=? AND local_id=? '
+                'ON CONFLICT(account,id,scene,source,local_id) DO UPDATE SET anchor=excluded.anchor,page_offset=excluded.page_offset',
+                (anchor,offset,self.account,identifier,job['username'],row['source'],message['local_id']))
+            return
 
     def record_send(self,identifier,scene,event,state):
         if state not in ('sending','confirmed','unconfirmed'):

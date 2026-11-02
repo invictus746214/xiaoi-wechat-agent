@@ -33,12 +33,13 @@ class StickerServiceTests(unittest.TestCase):
     def test_sync_confirms_native_id_and_does_not_repeat_unknown(self):
         native=Mock();native.favorite_records.return_value=[]
         def add(asset,job,select,before):before();return 'f'*32
-        native.favorite_latest.side_effect=add
+        native.favorite_source.side_effect=add
         reader=Mock();reader.messages.return_value=[]
         with patch('sticker_ui.NativeStickers',return_value=native):
             self.assertEqual(sync_sticker(Mock(),reader,self.job,self.library,self.store,bridge),'confirmed')
         self.assertEqual(self.library.get(self.asset)['native_state'],'confirmed')
         self.assertEqual(self.library.get(self.asset)['native_md5'],'f'*32)
+        native.favorite_source.assert_called_once();native.close.assert_called_once()
 
     def test_send_requires_native_receipt_and_replay_never_clicks_again(self):
         self.library.set_native(self.asset,'f'*32,'confirmed')

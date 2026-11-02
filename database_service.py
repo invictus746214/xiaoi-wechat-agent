@@ -69,7 +69,7 @@ def sync_sticker(ui,reader,job,library,store,b,should_yield=None):
         library.set_native(asset['id'],'','unconfirmed')
         return True
     try:
-        result=native.favorite_latest(asset,job,select_chat,submit)
+        result=native.favorite_source(asset,job,select_chat,submit)
         if re.fullmatch('[a-f0-9]{32}',result):
             library.set_native(asset['id'],result,'confirmed');store.set_delivery_state(event,'confirmed')
             LOG.info('db_sticker_favorite event=%s result=confirmed',event)
@@ -80,6 +80,9 @@ def sync_sticker(ui,reader,job,library,store,b,should_yield=None):
     except Exception:
         if store.delivery(event)['state']=='sending':store.set_delivery_state(event,'unconfirmed')
         raise
+    finally:
+        library.save_favorite_progress(asset['id'],job)
+        native.close()
 
 
 def sticker_requested(job):
@@ -170,6 +173,7 @@ def run_due_task(ui,reader,tasks,store,inbox,b,cfg,now=None,health=None,followup
                  sender=reader.contacts().get(task['person_id'],'') if task['kind']=='group' else '',batch=[],is_mention=task['kind']=='group')
         allowed,_=b.policy.allowed(cfg['policy'],dict(name=job['title'],kind=job['kind'],is_mention=job['is_mention'],engaged=True))
         if not allowed or b.quota_wait(store,job,cfg):continue
+        if followups and not followups.can_deliver(task,now=now):continue
         if not tasks.claim(task['id']):continue
         if health:health.note(job,'sending','command')
         try:
@@ -324,6 +328,39 @@ def stale_group_reply(reader,job,b,cfg):
     return (job.get('kind')=='group' and not job.get('is_mention')
             and job.get('group_reply_mode') in ('engaged','interject','proactive')
             and any(interrupts_parts(message,job,b,cfg) for message in fresh_incoming(reader,job)))
+
+
+def obsolete_reply(reader,job,inbox,store,b,cfg):
+    """Only discard an untouched model draft after its replacement input is durable."""
+    if job.get('command') or job.get('memory_response') or job.get('command_response'):
+        return ''
+    event=job['event_id']
+    if store._rows("SELECT 1 FROM outbox WHERE event_id=? OR event_id LIKE ? OR event_id IN (?,?) LIMIT 1",
+                   (event,event+':part:%','action:'+event,'sticker:'+event)):
+        return ''
+    cursors={}
+    for row in job.get('batch',[]):
+        cursors[row['source']]=max(cursors.get(row['source'],0),row['message']['local_id'])
+    relevant=[]
+    for source,local in cursors.items():
+        for message in reader.messages(job['username'],limit=200,after_id=local,source=source):
+            if message.get('outgoing'):continue
+            # Strict-mention replacements must retain their own permission to answer.
+            if (job.get('kind')=='group' and job.get('is_mention') and cfg.get('policy',{}).get('group_strict_mention')
+                    and message.get('quote_sender')!=job.get('account')
+                    and not b.mentioned_self(message.get('text',''),b.policy_self_names(cfg))):continue
+            spontaneous=job.get('kind')=='group' and not job.get('is_mention') and job.get('group_reply_mode') in ('engaged','interject','proactive')
+            if spontaneous or interrupts_parts(message,job,b,cfg):relevant.append((source,message['local_id']))
+    if not relevant:return ''
+    with inbox.lock:
+        durable=False
+        for source,local in relevant:
+            if inbox.db.execute("SELECT 1 FROM inbox WHERE account=? AND username=? AND source=? AND local_id=?",
+                    (job['account'],job['username'],source,local)).fetchone():durable=True;continue
+            cursor=inbox.cursor(job['account'],job['username'],source)
+            # Already-consumed rows may have been excluded by the initial history cutoff.
+            if cursor is None or cursor<local:return 'wait'
+    return 'obsolete' if durable else ''
 
 
 def build_job(batch, inbox, b, cfg, account):
@@ -829,7 +866,12 @@ def prepare_model(job, reader, responder, vision_fn, b, cfg, people=None, sticke
             parts.append("[图片/表情内容：%s]" % (description[:600] or "未能读取，不要猜测内容"))
         elif kind == 34:
             import voice_input
-            transcript=voice_input.transcribe_message(reader,dict(message,account=job['account'],chat_username=job['username'],source=row['source']),cfg)
+            phases={}
+            def phase(name,seconds):
+                phases[name]=seconds
+                if health:health.note_phase(job,name,seconds)
+            transcript=voice_input.transcribe_message(reader,dict(message,account=job['account'],chat_username=job['username'],source=row['source']),cfg,phase_callback=phase)
+            if not transcript and health:health.note(job,'media','voice_timeout' if phases.get('worker',0)>=cfg.get('voice_input',{}).get('timeout',15) else 'voice_unavailable')
             parts.append('[本条语音转写，可能有识别误差：'+transcript+']' if transcript else '[本条语音未能转写，不猜测内容]')
             if transcript:
                 job['voice_transcribed']=True;job.pop('media_fallback',None)
@@ -938,7 +980,8 @@ def capture_latest_media(ui, reader, job, b):
         os.unlink(path)
 
 
-def migrate_memory(ui, reader, inbox, store, b):
+def migrate_memory(ui, reader, inbox, store, b, should_stop=lambda:False):
+    if should_stop():return False
     sessions = reader.sessions(limit=10000)
     bounds = b.component_rect(ui.left_list, ui.pyatspi)
     pointer = ui.pointer()
@@ -946,6 +989,7 @@ def migrate_memory(ui, reader, inbox, store, b):
     pointer.scroll(40, up=True)
     previous = None
     for _ in range(50):
+        if should_stop():return False
         ui._discover()
         rows = ui.rows(ui.left_list)
         for name, _, row in rows:
@@ -963,6 +1007,7 @@ def migrate_memory(ui, reader, inbox, store, b):
         pointer.scroll(5)
     pointer.move(bounds.x + bounds.width // 2, bounds.y + bounds.height // 2)
     pointer.scroll(40, up=True)
+    return not should_stop()
 
 
 def run(cfg, config_path=None):
@@ -997,6 +1042,7 @@ def run(cfg, config_path=None):
     persona = {"text": b.settings.load_persona(cfg["persona_file"], b.agent.DEFAULT_PERSONA)}
     metrics = b.metrics_lib.Metrics(cfg["metrics"]["path"], cfg["metrics"]["enabled"])
     health=PipelineHealth(store,metrics)
+    health.runtime(reader.account,'startup')
     tasks=Tasks(store) if cfg.get('tasks',{}).get('enabled') or cfg.get('followups',{}).get('enabled') else None
     if tasks:tasks.recover()
     from followups import Followups
@@ -1115,7 +1161,9 @@ def run(cfg, config_path=None):
                     last_session_check = now
                     session = b.wechat_session()
                     if session and not active_account(session[0], reader):
+                        health.runtime(reader.account,'account_mismatch')
                         raise RuntimeError("active_account_not_verified")
+                    health.runtime(reader.account,'offline' if not session else 'reader_error' if ingestion.errors else 'online')
                 if not session:
                     time.sleep(1)
                     continue
@@ -1130,9 +1178,11 @@ def run(cfg, config_path=None):
                 if ui is None:
                     ui = b.WeChatUI()
                 if not legacy_migrated:
-                    migrate_memory(ui, reader, inbox, store, b)
+                    from startup_memory import migrate_once
+                    migrated=migrate_once(store,reader.account,lambda:migrate_memory(ui,reader,inbox,store,b,lambda:stopped))
+                    if stopped:continue
                     legacy_migrated = True
-                    LOG.info("db_executor_ready account_verified=true")
+                    LOG.info("db_executor_ready account_verified=true legacy_scan=%s",migrated)
                 if sticker_future and sticker_future[0].done():
                     future,collection_job=sticker_future;sticker_future=None
                     try:collection_result=future.result()
@@ -1165,6 +1215,12 @@ def run(cfg, config_path=None):
                     if job['kind']=='group' and cfg['policy'].get('group_strict_mention') and not job['is_mention']:
                         job['skip_reason']='policy';store.mark_event(job['event_id']);complete(job,'done');continue
                     job["text_started"] = bool(store._rows("SELECT 1 FROM outbox WHERE session_key=? AND event_id LIKE ? LIMIT 1", (job["session_key"],job["event_id"] + ':part:%')))
+                    obsolete=obsolete_reply(reader,job,inbox,store,b,cfg)
+                    if obsolete=='wait':
+                        complete(job,'defer',1);continue
+                    if obsolete=='obsolete':
+                        store.add_delivery_memory('obsolete:'+job['event_id'],job['session_key'],'user',job['message'])
+                        job['skip_reason']='obsolete';store.mark_event(job['event_id']);complete(job,'done');continue
                     stale=stale_group_reply(reader,job,b,cfg) or not semantic_reply_current(job,people)
                     if stale or b.is_silent_reply(reply) or (job.get("group_reply_mode") in ("proactive", "interject") and b.proactive_pass(reply)):
                         job['skip_reason']='stale_turn' if stale else 'model_silent'
@@ -1280,9 +1336,10 @@ def run(cfg, config_path=None):
                         if job.get('sticker_continue_requested') and cfg['stickers'].get('collect_enabled',True):
                             command_reply=continue_sticker_request(ui,reader,job,stickers,store,b,lambda:sticker_should_yield(inbox,job))
                         if tasks and command_reply is None:command_reply=task_command_reply(tasks,job)
-                        if command_reply is None and not job.get('quote_sender') and job['focus_text'].strip() in ('消息处理状态','运行状态'):
+                        if command_reply is None and not job.get('quote_sender') and job['focus_text'].strip() in ('消息处理状态','运行状态','为什么没回复','为什么不回消息','不回复原因'):
                             command_reply=health.report(job)
                     if command_reply is not None:
+                        job['command_response']=True
                         command_reply=command_reply[:1200]
                         inbox.save_reply(batch,freeze_reply(job,command_reply))
                         ready.append((job,command_reply))

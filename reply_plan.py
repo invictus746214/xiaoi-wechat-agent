@@ -4,12 +4,13 @@ PREFIX='\x1ereply-plan-v1:'
 
 def _validate(plan):
     required={'body','structured_reply','sticker_choice','sticker_only'}
-    if not isinstance(plan,dict) or not required<=set(plan) or set(plan)-required-{'semantic_sources'}:
+    if not isinstance(plan,dict) or not required<=set(plan) or set(plan)-required-{'semantic_sources','command_response'}:
         raise ValueError('invalid_reply_plan')
     if not isinstance(plan['body'],str) or not plan['body'] or len(plan['body'])>1200:
         raise ValueError('invalid_reply_body')
     if type(plan['structured_reply']) is not bool or type(plan['sticker_only']) is not bool:
         raise ValueError('invalid_reply_mode')
+    if 'command_response' in plan and type(plan['command_response']) is not bool:raise ValueError('invalid_command_response')
     choice=plan['sticker_choice']
     if choice is not None and (not isinstance(choice,str) or not re.fullmatch('[a-f0-9]{64}',choice)):
         raise ValueError('invalid_sticker_choice')
@@ -23,6 +24,7 @@ def _validate(plan):
 def freeze_reply(job,reply):
     plan=dict(body=reply,structured_reply=bool(job.get('structured_reply')),sticker_choice=job.get('sticker_choice'),sticker_only=bool(job.get('sticker_only')))
     if job.get('semantic_sources'):plan['semantic_sources']=job['semantic_sources']
+    if job.get('command_response'):plan['command_response']=True
     return PREFIX+json.dumps(_validate(plan),ensure_ascii=False,separators=(',',':'))
 
 def restore_reply(job,cached):
@@ -31,4 +33,5 @@ def restore_reply(job,cached):
     except (ValueError,TypeError) as exc:raise ValueError('invalid_cached_reply_plan') from exc
     job.update({key:plan[key] for key in ('structured_reply','sticker_choice','sticker_only')})
     if 'semantic_sources' in plan:job['semantic_sources']=plan['semantic_sources']
+    if 'command_response' in plan:job['command_response']=plan['command_response']
     return plan['body']
